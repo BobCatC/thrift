@@ -227,6 +227,10 @@ private:
     indent_up();
   }
 
+  bool field_is_required(t_field* tfield) {
+    return tfield->get_req() == t_field::T_REQUIRED;
+  }
+
   void block_close(ostream& out, bool end_line=true) {
     indent_down();
     indent(out) << "}";
@@ -248,7 +252,7 @@ private:
     const vector<t_field*>& members = tstruct->get_members();
     vector<t_field*>::const_iterator m_iter;
     for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
-      if (!field_is_optional(*m_iter)) {
+      if (field_is_required(*m_iter)) {
         return true;
       }
     }
@@ -259,7 +263,7 @@ private:
     const vector<t_field*>& members = tstruct->get_members();
     vector<t_field*>::const_iterator m_iter;
     for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
-      if (field_is_optional(*m_iter)) {
+      if (!field_is_required(*m_iter)) {
         return true;
       }
     }
@@ -801,15 +805,16 @@ void t_swift_generator::generate_swift_struct_init(ostream& out,
 
   bool first=true;
   for (m_iter = members.begin(); m_iter != members.end();) {
-    if (all || !field_is_optional(*m_iter)) {
+    if (all || field_is_required(*m_iter)) {
       if (first) {
         first = false;
       }
       else {
         out << ", ";
       }
+      bool opt = !field_is_required(*m_iter);
       out << (*m_iter)->get_name() << ": "
-          << maybe_escape_identifier(type_name((*m_iter)->get_type(), field_is_optional(*m_iter)));
+          << maybe_escape_identifier(type_name((*m_iter)->get_type(), opt));
     }
     ++m_iter;
   }
@@ -820,7 +825,7 @@ void t_swift_generator::generate_swift_struct_init(ostream& out,
   for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
     if (!gen_cocoa_) {
       bool should_set = all;
-      should_set = should_set || !field_is_optional((*m_iter));
+      should_set = should_set || field_is_required((*m_iter));
       if (should_set) {
         out << indent() << "self." << maybe_escape_identifier((*m_iter)->get_name()) << " = "
             << maybe_escape_identifier((*m_iter)->get_name()) << endl;
@@ -863,13 +868,13 @@ void t_swift_generator::generate_swift_struct_hashable_extension(ostream& out,
 
   if (!members.empty()) {
     indent(out) << "let prime = 31" << endl;
-    indent(out) << "var result = 1" << endl;
+    indent(out) << "var result: Int? = 1" << endl;
     if (!tstruct->is_union()) {
       for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
         t_field* tfield = *m_iter;
-        string accessor = field_is_optional(tfield) ? "?." : ".";
-        string defaultor = field_is_optional(tfield) ? " ?? 0" : "";
-        indent(out) << "result = prime &* result &+ (" << maybe_escape_identifier(tfield->get_name()) << accessor
+        string accessor = !field_is_required(tfield) ? "?." : ".";
+        string defaultor = !field_is_required(tfield) ? " ?? 0" : "";
+        indent(out) << "result = prime &* (result ?? 1) &+ (" << maybe_escape_identifier(tfield->get_name()) << accessor
                     <<  "hashValue" << defaultor << ")" << endl;
       }
     } else {
@@ -880,7 +885,7 @@ void t_swift_generator::generate_swift_struct_hashable_extension(ostream& out,
       }
       indent(out) << "}" << endl << endl;
     }
-    indent(out) << "return result" << endl;
+    indent(out) << "return result ?? 1" << endl;
   }
   else {
     indent(out) << "return 31" << endl;
@@ -1147,7 +1152,7 @@ void t_swift_generator::generate_swift_struct_reader(ostream& out,
     vector<t_field*>::const_iterator f_iter;
 
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter) {
-      bool optional = field_is_optional(*f_iter);
+      bool optional = !field_is_required(*f_iter);
       indent(out) << "var " << maybe_escape_identifier((*f_iter)->get_name()) << ": "
                   << type_name((*f_iter)->get_type(), optional, !optional) << endl;
     }
@@ -1217,7 +1222,7 @@ void t_swift_generator::generate_swift_struct_reader(ostream& out,
       indent(out) << "// Required fields" << endl;
 
       for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter) {
-        if (field_is_optional(*f_iter)) {
+        if (!field_is_required(*f_iter)) {
           continue;
         }
         indent(out) << "try proto.validateValue(" << (*f_iter)->get_name() << ", "
@@ -1249,7 +1254,7 @@ void t_swift_generator::generate_swift_struct_reader(ostream& out,
     vector<t_field*>::const_iterator f_iter;
 
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter) {
-      bool optional = field_is_optional(*f_iter);
+      bool optional = !field_is_required(*f_iter);
       indent(out) << "var " << maybe_escape_identifier((*f_iter)->get_name()) << " : "
                   << type_name((*f_iter)->get_type(), optional, !optional) << endl;
     }
@@ -1302,7 +1307,7 @@ void t_swift_generator::generate_swift_struct_reader(ostream& out,
       indent(out) << "// Required fields" << endl;
 
       for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter) {
-        if (field_is_optional(*f_iter)) {
+        if (!field_is_required(*f_iter)) {
           continue;
         }
         indent(out) << "try __proto.validateValue(" << (*f_iter)->get_name() << ", "
@@ -1356,7 +1361,7 @@ void t_swift_generator::generate_old_swift_struct_writer(ostream& out,
   for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter) {
     t_field *tfield = *f_iter;
 
-    bool optional = field_is_optional(tfield);
+    bool optional = !field_is_required(tfield);
     if (optional) {
       indent(out) << "if let " << maybe_escape_identifier(tfield->get_name())
                   << " = __value." << maybe_escape_identifier(tfield->get_name());
@@ -2751,17 +2756,18 @@ string t_swift_generator::declare_property(t_field* tfield, bool is_private) {
 
   render << visibility << " var " << maybe_escape_identifier(tfield->get_name());
 
-  if (field_is_optional(tfield)) {
-    render << (gen_cocoa_ ? " " : "") << ": " << type_name(tfield->get_type(), true);
-  }
-  else {
-    if (!gen_cocoa_) {
-      render << ": " << type_name(tfield->get_type(), false);
-    } else {
-      // Swift2/Cocoa backward compat, Bad, default init
-      render << " = " << type_name(tfield->get_type(), false) << "()";
-    }
-  }
+  // if (field_is_optional(tfield)) {
+    bool opt = !field_is_required(tfield);
+    render << (gen_cocoa_ ? " " : "") << ": " << type_name(tfield->get_type(), opt);
+  // }
+  // else {
+  //   if (!gen_cocoa_) {
+  //     render << ": " << type_name(tfield->get_type(), false);
+  //   } else {
+  //     // Swift2/Cocoa backward compat, Bad, default init
+  //     render << " = " << type_name(tfield->get_type(), false) << "()";
+  //   }
+  // }
 
   return render.str();
 }
@@ -2971,7 +2977,7 @@ string t_swift_generator::argument_list(t_struct* tstruct, string protocol_name,
     if (!gen_cocoa_) {
       // optional args not usually permitted for some reason, even though dynamic langs handle it
       // use annotation "swift.nullable" to achieve
-      result += arg->get_name() + ": " + type_name(arg->get_type(), field_is_optional(arg));
+      result += arg->get_name() + ": " + type_name(arg->get_type(), !field_is_required(arg));
     } else {
       result += arg->get_name() + ": " + type_name(arg->get_type());
     }
