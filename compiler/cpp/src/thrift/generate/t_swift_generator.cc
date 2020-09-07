@@ -868,25 +868,29 @@ void t_swift_generator::generate_swift_struct_hashable_extension(ostream& out,
 
   if (!members.empty()) {
     indent(out) << "let prime = 31" << endl;
-    indent(out) << "var result: Int? = 1" << endl;
+    indent(out) << "var thriftResult: Int = 1" << endl;
     if (!tstruct->is_union()) {
       for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
         t_field* tfield = *m_iter;
-        string accessor = !field_is_required(tfield) ? "?." : ".";
-        string defaultor = !field_is_required(tfield) ? " ?? 0" : "";
-        indent(out) << "result = prime &* (result ?? 1) &+ (" << maybe_escape_identifier(tfield->get_name()) << accessor
-                    <<  "hashValue" << defaultor << ")" << endl;
+        if (field_is_required(tfield)) {
+          indent(out) << "thriftResult = prime &* thriftResult &+ " + tfield->get_name() << "." << "hashValue" << endl;
+          continue;
+        }
+        indent(out) << "if let " << "u" + tfield->get_name() + " = " << maybe_escape_identifier(tfield->get_name());
+        block_open(out);
+        indent(out) << "  " << "thriftResult = prime &* thriftResult &+ " << "u" + tfield->get_name() << "." << "hashValue" << endl;
+        block_close(out);
       }
     } else {
       indent(out) << "switch self {" << endl;
-      for (m_iter = members.begin(); m_iter != members.end(); m_iter++) {
-        t_field *tfield = *m_iter;
-        indent(out) << "case ." << tfield->get_name() << "(let val): result = prime &* val.hashValue" << endl;
-      }
+        for (m_iter = members.begin(); m_iter != members.end(); m_iter++) {
+          t_field *tfield = *m_iter;
+          indent(out) << "case ." << tfield->get_name() << "(let val): thriftResult = prime &* val.hashValue" << endl;
+        }
       indent(out) << "}" << endl << endl;
     }
-    indent(out) << "return result ?? 1" << endl;
-  }
+      indent(out) << "return thriftResult" << endl;
+    }
   else {
     indent(out) << "return 31" << endl;
   }
