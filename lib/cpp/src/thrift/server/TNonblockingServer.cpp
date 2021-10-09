@@ -1341,7 +1341,7 @@ bool TNonblockingIOThread::notify(TNonblockingServer::TConnection* conn) {
     FD_ZERO(&efds);
     FD_SET(fd, &wfds);
     FD_SET(fd, &efds);
-    ret = select(static_cast<int>(fd + 1), NULL, &wfds, &efds, NULL);
+    ret = select(static_cast<int>(fd + 1), nullptr, &wfds, &efds, nullptr);
     if (ret < 0) {
       return false;
     } else if (ret == 0) {
@@ -1438,7 +1438,7 @@ void TNonblockingIOThread::setCurrentThreadHighPriority(bool value) {
 #ifdef HAVE_SCHED_H
   // Start out with a standard, low-priority setup for the sched params.
   struct sched_param sp;
-  bzero((void*)&sp, sizeof(sp));
+  memset(static_cast<void*>(&sp), 0, sizeof(sp));
   int policy = SCHED_OTHER;
 
   // If desired, set up high-priority sched params structure.

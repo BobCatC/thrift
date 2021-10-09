@@ -80,7 +80,7 @@ type serializer interface {
 }
 
 type deserializer interface {
-	ReadString(TStruct, string) error
+	ReadString(context.Context, TStruct, string) error
 }
 
 func plainSerializer(pf ProtocolFactory) serializer {
@@ -158,7 +158,7 @@ func ProtocolTest1(t *testing.T, pf ProtocolFactory) {
 
 				t1 := impl.Deserializer(pf)
 				var m1 MyTestStruct
-				if err = t1.ReadString(&m1, s); err != nil {
+				if err = t1.ReadString(context.Background(), &m1, s); err != nil {
 					test.Fatalf("Unable to Deserialize struct: %v", err)
 
 				}
@@ -199,7 +199,7 @@ func ProtocolTest2(t *testing.T, pf ProtocolFactory) {
 
 				t1 := impl.Deserializer(pf)
 				var m1 MyTestStruct
-				if err = t1.ReadString(&m1, s); err != nil {
+				if err = t1.ReadString(context.Background(), &m1, s); err != nil {
 					test.Fatalf("Unable to Deserialize struct: %v", err)
 
 				}
@@ -213,20 +213,18 @@ func ProtocolTest2(t *testing.T, pf ProtocolFactory) {
 }
 
 func TestSerializer(t *testing.T) {
-
-	var protocol_factories map[string]ProtocolFactory
-	protocol_factories = make(map[string]ProtocolFactory)
-	protocol_factories["Binary"] = NewTBinaryProtocolFactoryDefault()
-	protocol_factories["Compact"] = NewTCompactProtocolFactory()
-	//protocol_factories["SimpleJSON"] = NewTSimpleJSONProtocolFactory() - write only, can't be read back by design
-	protocol_factories["JSON"] = NewTJSONProtocolFactory()
+	protocolFactories := make(map[string]ProtocolFactory)
+	protocolFactories["Binary"] = NewTBinaryProtocolFactoryDefault()
+	protocolFactories["Compact"] = NewTCompactProtocolFactory()
+	//protocolFactories["SimpleJSON"] = NewTSimpleJSONProtocolFactory() - write only, can't be read back by design
+	protocolFactories["JSON"] = NewTJSONProtocolFactory()
 
 	tests := make(map[string]func(*testing.T, ProtocolFactory))
 	tests["Test 1"] = ProtocolTest1
 	tests["Test 2"] = ProtocolTest2
 	//tests["Test 3"] = ProtocolTest3 // Example of how to add additional tests
 
-	for name, pf := range protocol_factories {
+	for name, pf := range protocolFactories {
 		t.Run(
 			name,
 			func(t *testing.T) {
@@ -241,7 +239,6 @@ func TestSerializer(t *testing.T) {
 			},
 		)
 	}
-
 }
 
 func TestSerializerPoolAsync(t *testing.T) {
@@ -264,7 +261,7 @@ func TestSerializerPoolAsync(t *testing.T) {
 						t.Fatal("serialize:", err)
 					}
 					var m1 MyTestStruct
-					if err = d.ReadString(&m1, str); err != nil {
+					if err = d.ReadString(context.Background(), &m1, str); err != nil {
 						t.Fatal("deserialize:", err)
 
 					}
@@ -335,7 +332,7 @@ func BenchmarkSerializer(b *testing.B) {
 					str, _ := s.WriteString(context.Background(), &m)
 					var m1 MyTestStruct
 					d := c.Deserializer()
-					d.ReadString(&m1, str)
+					d.ReadString(context.Background(), &m1, str)
 				}
 			},
 		)

@@ -51,6 +51,8 @@ t_netstd_generator::t_netstd_generator(t_program* program, const map<string, str
     : t_oop_generator(program)
 {
     (void)option_string;
+    suppress_deepcopy = false;
+    add_async_postfix = false;
     use_pascal_case_properties = false;
     union_ = false;
     serialize_ = false;
@@ -62,23 +64,25 @@ t_netstd_generator::t_netstd_generator(t_program* program, const map<string, str
 
     for (iter = parsed_options.begin(); iter != parsed_options.end(); ++iter)
     {
-        if (iter->first.compare("union") == 0)
-        {
+        if (iter->first.compare("union") == 0) {
             union_ = true;
         }
-        else if (iter->first.compare("serial") == 0)
-        {
+        else if (iter->first.compare("serial") == 0) {
             serialize_ = true;
             wcf_namespace_ = iter->second; // since there can be only one namespace
         }
-        else if (iter->first.compare("wcf") == 0)
-        {
+        else if (iter->first.compare("wcf") == 0) {
             wcf_ = true;
             wcf_namespace_ = iter->second;
         }
-        else if (iter->first.compare("pascal") == 0)
-        {
+        else if (iter->first.compare("pascal") == 0) {
           use_pascal_case_properties = true;
+        }
+        else if (iter->first.compare("no_deepcopy") == 0) {
+          suppress_deepcopy = true;
+        }
+        else if (iter->first.compare("async_postfix") == 0) {
+          add_async_postfix = true;
         }
         else {
           throw "unknown option netstd:" + iter->first;
@@ -88,56 +92,23 @@ t_netstd_generator::t_netstd_generator(t_program* program, const map<string, str
     out_dir_base_ = "gen-netstd";
 }
 
-static string correct_function_name_for_async(string const& function_name)
-{
-    string const async_end = "Async";
-    size_t i = function_name.find(async_end);
-    if (i != string::npos)
-    {
-        return function_name + async_end;
-    }
-
-    return function_name;
-}
-
-/**
-* \brief Search and replace "_args" substring in struct name if exist (for C# class naming)
-* \param struct_name
-* \return Modified struct name ("Struct_args" -> "StructArgs") or original name
-*/
-static string check_and_correct_struct_name(const string& struct_name)
-{
-    string args_end = "_args";
-    size_t i = struct_name.find(args_end);
-    if (i != string::npos)
-    {
-        string new_struct_name = struct_name;
-        new_struct_name.replace(i, args_end.length(), "Args");
-        return new_struct_name;
-    }
-
-    string result_end = "_result";
-    size_t j = struct_name.find(result_end);
-    if (j != string::npos)
-    {
-        string new_struct_name = struct_name;
-        new_struct_name.replace(j, result_end.length(), "Result");
-        return new_struct_name;
-    }
-
-    return struct_name;
-}
-
-static bool field_has_default(t_field* tfield) { return tfield->get_value() != NULL; }
+static bool field_has_default(t_field* tfield) { return tfield->get_value() != nullptr; }
 
 static bool field_is_required(t_field* tfield) { return tfield->get_req() == t_field::T_REQUIRED; }
 
-static bool type_can_be_null(t_type* ttype)
+static t_type* resolve_typedef(t_type* ttype)
 {
     while (ttype->is_typedef())
     {
         ttype = static_cast<t_typedef*>(ttype)->get_type();
     }
+    return ttype;
+}
+
+
+static bool type_can_be_null(t_type* ttype)
+{
+    ttype = resolve_typedef(ttype);
 
     return ttype->is_container() || ttype->is_struct() || ttype->is_xception() || ttype->is_string();
 }
@@ -184,23 +155,31 @@ void t_netstd_generator::init_generator()
     }
 
     pverbose(".NET Standard options:\n");
-    pverbose("- union ...... %s\n", (is_union_enabled() ? "ON" : "off"));
-    pverbose("- serialize .. %s\n", (is_serialize_enabled() ? "ON" : "off"));
-    pverbose("- wcf ........ %s\n", (is_wcf_enabled() ? "ON" : "off"));
-    pverbose("- pascal ..... %s\n", (use_pascal_case_properties ? "ON" : "off"));
+    pverbose("- union ........... %s\n", (is_union_enabled() ? "ON" : "off"));
+    pverbose("- serialize ....... %s\n", (is_serialize_enabled() ? "ON" : "off"));
+    pverbose("- wcf ............. %s\n", (is_wcf_enabled() ? "ON" : "off"));
+    pverbose("- pascal .......... %s\n", (use_pascal_case_properties ? "ON" : "off"));
+    pverbose("- no_deepcopy ..... %s\n", (suppress_deepcopy ? "ON" : "off"));
+    pverbose("- async_postfix ... %s\n", (add_async_postfix ? "ON" : "off"));
 }
 
-string t_netstd_generator::normalize_name(string name)
+string t_netstd_generator::normalize_name(string name, bool is_arg_name)
 {
     string tmp(name);
     transform(tmp.begin(), tmp.end(), tmp.begin(), static_cast<int(*)(int)>(tolower));
+
+    // check for reserved argument names
+    if( is_arg_name && (CANCELLATION_TOKEN_NAME == name))
+	{
+		name += "_";
+	}
 
     // un-conflict keywords by prefixing with "@"
     if (netstd_keywords.find(tmp) != netstd_keywords.end())
     {
         return "@" + name;
     }
-
+	
     // no changes necessary
     return name;
 }
@@ -316,8 +295,20 @@ void t_netstd_generator::init_keywords()
     netstd_keywords["when"] = 1;
 }
 
+void t_netstd_generator::reset_indent() {
+  while( indent_count() > 0) {
+    indent_down();
+  }
+}
+
+
 void t_netstd_generator::start_netstd_namespace(ostream& out)
 {
+    out << "#pragma warning disable IDE0079  // remove unnecessary pragmas" << endl
+        << "#pragma warning disable IDE1006  // parts of the code use IDL spelling" << endl
+        << "#pragma warning disable IDE0083  // pattern matching \"that is not SomeType\" requires net5.0 but we still support earlier versions" << endl
+        << endl;
+
     if (!namespace_name_.empty())
     {
         out << "namespace " << namespace_name_ << endl;
@@ -341,8 +332,10 @@ string t_netstd_generator::netstd_type_usings() const
         "using System.Collections.Generic;\n"
         "using System.Text;\n"
         "using System.IO;\n"
+        "using System.Linq;\n"
         "using System.Threading;\n"
         "using System.Threading.Tasks;\n"
+        "using Microsoft.Extensions.Logging;\n"
         "using Thrift;\n"
         "using Thrift.Collections;\n";
 
@@ -371,6 +364,8 @@ string t_netstd_generator::netstd_thrift_usings() const
 
 void t_netstd_generator::close_generator()
 {
+    // right at the end, after everything else
+    generate_extensions_file();
 }
 
 void t_netstd_generator::generate_typedef(t_typedef* ttypedef)
@@ -394,12 +389,13 @@ void t_netstd_generator::generate_enum(t_enum* tenum)
 
 void t_netstd_generator::generate_enum(ostream& out, t_enum* tenum)
 {
+    reset_indent();
     out << autogen_comment() << endl;
 
     start_netstd_namespace(out);
     generate_netstd_doc(out, tenum);
 
-    out << indent() << "public enum " << tenum->get_name() << endl;
+    out << indent() << "public enum " << type_name(tenum,false) << endl;
     scope_up(out);
 
     vector<t_enum_value*> constants = tenum->get_constants();
@@ -439,6 +435,7 @@ void t_netstd_generator::generate_consts(ostream& out, vector<t_const*> consts)
         return;
     }
 
+    reset_indent();
     out << autogen_comment() << netstd_type_usings() << endl;
 
     start_netstd_namespace(out);
@@ -475,11 +472,12 @@ void t_netstd_generator::print_const_def_value(ostream& out, string name, t_type
         const map<t_const_value*, t_const_value*, t_const_value::value_compare>& val = value->get_map();
         vector<t_field*>::const_iterator f_iter;
         map<t_const_value*, t_const_value*, t_const_value::value_compare>::const_iterator v_iter;
+        collect_extensions_types(static_cast<t_struct*>(type));
         prepare_member_name_mapping(static_cast<t_struct*>(type));
 
         for (v_iter = val.begin(); v_iter != val.end(); ++v_iter)
         {
-            t_field* field = NULL;
+            t_field* field = nullptr;
 
             for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
             {
@@ -489,7 +487,7 @@ void t_netstd_generator::print_const_def_value(ostream& out, string name, t_type
                 }
             }
 
-            if (field == NULL)
+            if (field == nullptr)
             {
                 throw "type error: " + type->get_name() + " has no field " + v_iter->first->get_string();
             }
@@ -558,10 +556,8 @@ bool t_netstd_generator::print_const_value(ostream& out, string name, t_type* ty
 {
     out << indent();
     bool need_static_construction = !in_static;
-    while (type->is_typedef())
-    {
-        type = static_cast<t_typedef*>(type)->get_type();
-    }
+
+    type = resolve_typedef( type);
 
     if (!defval || needtype)
     {
@@ -611,7 +607,11 @@ string t_netstd_generator::render_const_value(ostream& out, string name, t_type*
         switch (tbase)
         {
         case t_base_type::TYPE_STRING:
-            render << '"' << get_escaped_string(value) << '"';
+            if (type->is_binary()) {
+                render << "System.Text.Encoding.UTF8.GetBytes(\"" << get_escaped_string(value) << "\")";
+            } else {
+                render << '"' << get_escaped_string(value) << '"';
+            }
             break;
         case t_base_type::TYPE_BOOL:
             render << ((value->get_integer() > 0) ? "true" : "false");
@@ -638,7 +638,7 @@ string t_netstd_generator::render_const_value(ostream& out, string name, t_type*
     }
     else if (type->is_enum())
     {
-        render << type->get_name() << "." << value->get_identifier_name();
+        render << type_name(type) << "." << value->get_identifier_name();
     }
     else
     {
@@ -650,8 +650,194 @@ string t_netstd_generator::render_const_value(ostream& out, string name, t_type*
     return render.str();
 }
 
+void t_netstd_generator::collect_extensions_types(t_struct* tstruct)
+{
+    const vector<t_field*>& members = tstruct->get_members();
+    vector<t_field*>::const_iterator m_iter;
+
+    // make private members with public Properties
+    for (m_iter = members.begin(); m_iter != members.end(); ++m_iter)
+    {
+        collect_extensions_types((*m_iter)->get_type());
+    }
+}
+
+void t_netstd_generator::collect_extensions_types(t_type* ttype)
+{
+    ttype = resolve_typedef( ttype);
+    string key = type_name(ttype);
+
+    if (ttype->is_struct() || ttype->is_xception())
+    {
+        if( checked_extension_types.find(key) == checked_extension_types.end())
+        {
+            checked_extension_types[key] = ttype;    // prevent recursion
+
+            t_struct* tstruct = static_cast<t_struct*>(ttype);
+            collect_extensions_types(tstruct);
+        }
+        return;
+    }
+
+    if (ttype->is_map() || ttype->is_set() || ttype->is_list())
+    {
+        if( collected_extension_types.find(key) == collected_extension_types.end())
+        {
+            collected_extension_types[key] = ttype;   // prevent recursion
+
+            if( ttype->is_map())
+            {
+                t_map* tmap = static_cast<t_map*>(ttype);
+                collect_extensions_types(tmap->get_key_type());
+                collect_extensions_types(tmap->get_val_type());
+            }
+            else if (ttype->is_set())
+            {
+                t_set* tset = static_cast<t_set*>(ttype);
+                collect_extensions_types(tset->get_elem_type());
+            }
+            else if (ttype->is_list())
+            {
+                t_list* tlist = static_cast<t_list*>(ttype);
+                collect_extensions_types(tlist->get_elem_type());
+            }
+        }
+
+        return;
+    }
+}
+
+void t_netstd_generator::generate_extensions_file()
+{
+    if (collected_extension_types.empty())
+    {
+        return;
+    }
+
+    string f_exts_name = namespace_dir_ + '/' + program_name_ + ".Extensions.cs";
+    ofstream_with_content_based_conditional_update f_exts;
+    f_exts.open(f_exts_name.c_str());
+
+    generate_extensions(f_exts, collected_extension_types);
+
+    f_exts.close();
+}
+
+void t_netstd_generator::generate_extensions(ostream& out, map<string, t_type*> types)
+{
+    if (types.empty())
+    {
+        return;
+    }
+
+    reset_indent();
+    out << autogen_comment() << netstd_type_usings() << endl;
+
+    start_netstd_namespace(out);
+
+    out << indent() << "public static class " << make_valid_csharp_identifier(program_name_) << "Extensions" << endl;
+    scope_up(out);
+
+    bool needs_typecast = false;
+    std::map<string,t_type*>::const_iterator iter;
+    for( iter = types.begin(); iter != types.end(); ++iter)
+    {
+        out << indent() << "public static bool Equals(this " << iter->first << " instance, object that)" << endl;
+        scope_up(out);
+        out << indent() << "if (!(that is " << iter->first << " other)) return false;" << endl;
+        out << indent() << "if (ReferenceEquals(instance, other)) return true;" << endl;
+        out << endl;
+        out << indent() << "return TCollections.Equals(instance, other);" << endl;
+        scope_down(out);
+        out << endl << endl;
+
+        out << indent() << "public static int GetHashCode(this " << iter->first << " instance)" << endl;
+        scope_up(out);
+        out << indent() << "return TCollections.GetHashCode(instance);" << endl;
+        scope_down(out);
+        out << endl << endl;
+
+        if(! suppress_deepcopy) {
+            out << indent() << "public static " << iter->first << " " << DEEP_COPY_METHOD_NAME << "(this " << iter->first << " source)" << endl;
+            scope_up(out);
+            out << indent() << "if (source == null)" << endl;
+            indent_up();
+            out << indent() << "return null;" << endl << endl;
+            indent_down();
+
+            string tmp_instance = tmp("tmp");
+            out << indent() << "var " << tmp_instance << " = new " << iter->first << "(source.Count);" << endl;
+            if( iter->second->is_map())
+            {
+                t_map* tmap = static_cast<t_map*>(iter->second);
+                string copy_key = get_deep_copy_method_call(tmap->get_key_type(), needs_typecast);
+                string copy_val = get_deep_copy_method_call(tmap->get_val_type(), needs_typecast);
+                bool null_key = type_can_be_null(tmap->get_key_type());
+                bool null_val = type_can_be_null(tmap->get_val_type());
+
+                out << indent() << "foreach (var pair in source)" << endl;
+                indent_up();
+                out << indent() << tmp_instance << ".Add(";
+                if( null_key)
+                {
+                    out << "(pair.Key != null) ? pair.Key" << copy_key << " : null";
+                } else {
+                    out << "pair.Key" << copy_key;
+                }
+                out << ", ";
+                if( null_val)
+                {
+                    out << "(pair.Value != null) ? pair.Value" << copy_val << " : null";
+                } else {
+                    out << "pair.Value" << copy_val;
+                }
+                out << ");" << endl;
+                indent_down();
+
+            } else if( iter->second->is_set() || iter->second->is_list()) {
+                string copy_elm;
+                bool null_elm = false;
+                if (iter->second->is_set())
+                {
+                    t_set* tset = static_cast<t_set*>(iter->second);
+                    copy_elm = get_deep_copy_method_call(tset->get_elem_type(), needs_typecast);
+                    null_elm = type_can_be_null(tset->get_elem_type());
+                }
+                else // list
+                {
+                    t_list* tlist = static_cast<t_list*>(iter->second);
+                    copy_elm = get_deep_copy_method_call(tlist->get_elem_type(), needs_typecast);
+                    null_elm = type_can_be_null(tlist->get_elem_type());
+                }
+
+                out << indent() << "foreach (var elem in source)" << endl;
+                indent_up();
+                out << indent() << tmp_instance << ".Add(";
+                if( null_elm)
+                {
+                    out << "(elem != null) ? elem" << copy_elm << " : null";
+                } else {
+                    out << "elem" << copy_elm;
+                }
+                out << ");" << endl;
+                indent_down();
+            }
+
+            out << indent() << "return " << tmp_instance << ";" << endl;
+            scope_down(out);
+            out << endl << endl;
+        }
+    }
+
+
+    scope_down(out);
+    end_netstd_namespace(out);
+}
+
 void t_netstd_generator::generate_struct(t_struct* tstruct)
 {
+    collect_extensions_types(tstruct);
+
     if (is_union_enabled() && tstruct->is_union())
     {
         generate_netstd_union(tstruct);
@@ -676,6 +862,7 @@ void t_netstd_generator::generate_netstd_struct(t_struct* tstruct, bool is_excep
 
     f_struct.open(f_struct_name.c_str());
 
+  reset_indent();
     f_struct << autogen_comment() << netstd_type_usings() << netstd_thrift_usings() << endl;
 
     generate_netstd_struct_definition(f_struct, tstruct, is_exception);
@@ -695,6 +882,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
     out << endl;
 
     generate_netstd_doc(out, tstruct);
+    collect_extensions_types(tstruct);
     prepare_member_name_mapping(tstruct);
 
     if ((is_serialize_enabled() || is_wcf_enabled()) && !is_exception)
@@ -704,7 +892,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
 
     bool is_final = tstruct->annotations_.find("final") != tstruct->annotations_.end();
 
-    string sharp_struct_name = check_and_correct_struct_name(normalize_name(tstruct->get_name()));
+    string sharp_struct_name = type_name(tstruct, false);
 
     out << indent() << "public " << (is_final ? "sealed " : "") << "partial class " << sharp_struct_name << " : ";
 
@@ -741,7 +929,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
         if (is_required)
         {
             has_required_fields = true;
-        }
+    }
         else
         {
             has_non_required_fields = true;
@@ -777,7 +965,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
                 {
                     out << indent() << "[DataMember]" << endl;
                 }
-                out << indent() << "public bool " << normalize_name((*m_iter)->get_name()) << ";" << endl;
+                out << indent() << "public bool " << get_isset_name(normalize_name((*m_iter)->get_name())) << ";" << endl;
             }
         }
 
@@ -798,7 +986,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
                     out << indent() << "public bool ShouldSerialize" << prop_name(*m_iter) << "()" << endl
                         << indent() << "{" << endl;
                     indent_up();
-                    out << indent() << "return __isset." << normalize_name((*m_iter)->get_name()) << ";" << endl;
+                    out << indent() << "return __isset." << get_isset_name(normalize_name((*m_iter)->get_name())) << ";" << endl;
                     indent_down();
                     out << indent() << "}" << endl << endl;
                 }
@@ -816,11 +1004,9 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
     for (m_iter = members.begin(); m_iter != members.end(); ++m_iter)
     {
         t_type* t = (*m_iter)->get_type();
-        while (t->is_typedef())
-        {
-            t = static_cast<t_typedef*>(t)->get_type();
-        }
-        if ((*m_iter)->get_value() != NULL)
+        t = resolve_typedef(t);
+
+        if ((*m_iter)->get_value() != nullptr)
         {
             if (field_is_required((*m_iter)))
             {
@@ -830,13 +1016,14 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
             {
                 print_const_value(out, "this._" + (*m_iter)->get_name(), t, (*m_iter)->get_value(), true, true);
                 // Optionals with defaults are marked set
-                out << indent() << "this.__isset." << normalize_name((*m_iter)->get_name()) << " = true;" << endl;
+                out << indent() << "this.__isset." << get_isset_name(normalize_name((*m_iter)->get_name())) << " = true;" << endl;
             }
         }
     }
     indent_down();
     out << indent() << "}" << endl << endl;
 
+    // if we have required fields, we add that CTOR too
     if (has_required_fields)
     {
         out << indent() << "public " << sharp_struct_name << "(";
@@ -853,7 +1040,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
                 {
                     out << ", ";
                 }
-                out << type_name((*m_iter)->get_type()) << " " << (*m_iter)->get_name();
+                out << type_name((*m_iter)->get_type()) << " " << normalize_name((*m_iter)->get_name());
             }
         }
         out << ") : this()" << endl
@@ -864,13 +1051,16 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
         {
             if (field_is_required(*m_iter))
             {
-                out << indent() << "this." << prop_name(*m_iter) << " = " << (*m_iter)->get_name() << ";" << endl;
+                out << indent() << "this." << prop_name(*m_iter) << " = " << normalize_name((*m_iter)->get_name()) << ";" << endl;
             }
         }
 
         indent_down();
         out << indent() << "}" << endl << endl;
     }
+
+    // DeepCopy()
+    generate_netstd_deepcopy_method(out, tstruct, sharp_struct_name);
 
     generate_netstd_struct_reader(out, tstruct);
     if (is_result)
@@ -901,6 +1091,7 @@ void t_netstd_generator::generate_netstd_struct_definition(ostream& out, t_struc
     }
 }
 
+
 void t_netstd_generator::generate_netstd_wcffault(ostream& out, t_struct* tstruct)
 {
     out << endl;
@@ -908,7 +1099,7 @@ void t_netstd_generator::generate_netstd_wcffault(ostream& out, t_struct* tstruc
 
     bool is_final = tstruct->annotations_.find("final") != tstruct->annotations_.end();
 
-    out << indent() << "public " << (is_final ? "sealed " : "") << "partial class " << tstruct->get_name() << "Fault" << endl
+    out << indent() << "public " << (is_final ? "sealed " : "") << "partial class " << type_name(tstruct,false) << "Fault" << endl
         << indent() << "{" << endl;
     indent_up();
 
@@ -935,9 +1126,53 @@ void t_netstd_generator::generate_netstd_wcffault(ostream& out, t_struct* tstruc
     out << indent() << "}" << endl << endl;
 }
 
+void t_netstd_generator::generate_netstd_deepcopy_method(ostream& out, t_struct* tstruct, std::string sharp_struct_name)
+{
+    if( suppress_deepcopy) {
+        return;  // feature disabled
+    }
+
+    const vector<t_field*>& members = tstruct->get_members();
+    vector<t_field*>::const_iterator m_iter;
+
+    out << indent() << "public " << sharp_struct_name << " " << DEEP_COPY_METHOD_NAME << "()" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+
+    // return directly if there are only required fields
+    string tmp_instance = tmp("tmp");
+    out << indent() << "var " << tmp_instance << " = new " << sharp_struct_name << "();" << endl;
+
+    for (m_iter = members.begin(); m_iter != members.end(); ++m_iter) {
+        bool needs_typecast = false;
+        t_type* ttype = (*m_iter)->get_type();
+        string copy_op = get_deep_copy_method_call(ttype, needs_typecast);
+
+        bool is_required = field_is_required(*m_iter);
+        generate_null_check_begin( out, *m_iter);
+
+        out << indent() << tmp_instance << "." << prop_name(*m_iter) << " = ";
+        if( needs_typecast) {
+            out << "(" << type_name(ttype) << ")";
+        }
+        out << "this." << prop_name(*m_iter) << copy_op << ";" << endl;
+
+        generate_null_check_end( out, *m_iter);
+        if( !is_required) {
+            out << indent() << tmp_instance << ".__isset." << get_isset_name(normalize_name((*m_iter)->get_name()))
+                 << " = this.__isset." << get_isset_name(normalize_name((*m_iter)->get_name())) << ";" << endl;
+        }
+    }
+
+    out << indent() << "return " << tmp_instance << ";" << endl;
+
+    indent_down();
+    out << indent() << "}" << endl << endl;
+}
+
 void t_netstd_generator::generate_netstd_struct_reader(ostream& out, t_struct* tstruct)
 {
-    out << indent() << "public async Task ReadAsync(TProtocol iprot, CancellationToken cancellationToken)" << endl
+    out << indent() << "public async global::System.Threading.Tasks.Task ReadAsync(TProtocol iprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl
         << indent() << "{" << endl;
     indent_up();
     out << indent() << "iprot.IncrementRecursionDepth();" << endl
@@ -958,11 +1193,11 @@ void t_netstd_generator::generate_netstd_struct_reader(ostream& out, t_struct* t
     }
 
     out << indent() << "TField field;" << endl
-        << indent() << "await iprot.ReadStructBeginAsync(cancellationToken);" << endl
+        << indent() << "await iprot.ReadStructBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "while (true)" << endl
         << indent() << "{" << endl;
     indent_up();
-    out << indent() << "field = await iprot.ReadFieldBeginAsync(cancellationToken);" << endl
+    out << indent() << "field = await iprot.ReadFieldBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "if (field.Type == TType.Stop)" << endl
         << indent() << "{" << endl;
     indent_up();
@@ -993,7 +1228,7 @@ void t_netstd_generator::generate_netstd_struct_reader(ostream& out, t_struct* t
             << indent() << "else" << endl
             << indent() << "{" << endl;
         indent_up();
-        out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, cancellationToken);" << endl;
+        out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, " << CANCELLATION_TOKEN_NAME << ");" << endl;
         indent_down();
         out << indent() << "}" << endl
             << indent() << "break;" << endl;
@@ -1002,17 +1237,17 @@ void t_netstd_generator::generate_netstd_struct_reader(ostream& out, t_struct* t
 
     out << indent() << "default: " << endl;
     indent_up();
-    out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, cancellationToken);" << endl
+    out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, " << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "break;" << endl;
     indent_down();
     indent_down();
     out << indent() << "}" << endl
         << endl
-        << indent() << "await iprot.ReadFieldEndAsync(cancellationToken);" << endl;
+        << indent() << "await iprot.ReadFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     indent_down();
     out << indent() << "}" << endl
         << endl
-        << indent() << "await iprot.ReadStructEndAsync(cancellationToken);" << endl;
+        << indent() << "await iprot.ReadStructEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
 
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
@@ -1039,9 +1274,47 @@ void t_netstd_generator::generate_netstd_struct_reader(ostream& out, t_struct* t
     out << indent() << "}" << endl << endl;
 }
 
+
+void t_netstd_generator::generate_null_check_begin(ostream& out, t_field* tfield) {
+    bool is_required = field_is_required(tfield);
+    bool null_allowed = type_can_be_null(tfield->get_type());
+
+    if( null_allowed || (!is_required)) {
+        bool first = true;
+        out << indent() << "if(";
+
+        if( null_allowed) {
+            out << "(" << prop_name(tfield) << " != null)";
+            first = false;
+        }
+
+        if( !is_required) {
+            if( !first) {
+                out << " && ";
+            }
+            out << "__isset." << get_isset_name(normalize_name(tfield->get_name()));
+        }
+
+        out << ")" << endl
+            << indent() << "{" << endl;
+        indent_up();
+    }
+}
+
+
+void t_netstd_generator::generate_null_check_end(ostream& out, t_field* tfield) {
+    bool is_required = field_is_required(tfield);
+    bool null_allowed = type_can_be_null(tfield->get_type());
+
+    if( null_allowed || (!is_required)) {
+        indent_down();
+        out << indent() << "}" << endl;
+    }
+}
+
 void t_netstd_generator::generate_netstd_struct_writer(ostream& out, t_struct* tstruct)
 {
-    out << indent() << "public async Task WriteAsync(TProtocol oprot, CancellationToken cancellationToken)" << endl
+    out << indent() << "public async global::System.Threading.Tasks.Task WriteAsync(TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl
         << indent() << "{" << endl;
     indent_up();
 
@@ -1054,49 +1327,31 @@ void t_netstd_generator::generate_netstd_struct_writer(ostream& out, t_struct* t
     const vector<t_field*>& fields = tstruct->get_sorted_members();
     vector<t_field*>::const_iterator f_iter;
 
-    out << indent() << "var struc = new TStruct(\"" << name << "\");" << endl
-        << indent() << "await oprot.WriteStructBeginAsync(struc, cancellationToken);" << endl;
+    string tmpvar = tmp("tmp");
+    out << indent() << "var " << tmpvar << " = new TStruct(\"" << name << "\");" << endl
+        << indent() << "await oprot.WriteStructBeginAsync(" << tmpvar << ", " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
     if (fields.size() > 0)
     {
-        out << indent() << "var field = new TField();" << endl;
+        tmpvar = tmp("tmp");
+        out << indent() << "var " << tmpvar << " = new TField();" << endl;
         for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
         {
-            bool is_required = field_is_required(*f_iter);
-            if (!is_required)
-            {
-                bool null_allowed = type_can_be_null((*f_iter)->get_type());
-                if (null_allowed)
-                {
-                    out << indent() << "if (" << prop_name(*f_iter) << " != null && __isset." << normalize_name((*f_iter)->get_name()) << ")" << endl
-                        << indent() << "{" << endl;
-                    indent_up();
-                }
-                else
-                {
-                    out << indent() << "if (__isset." << normalize_name((*f_iter)->get_name()) << ")" << endl
-                        << indent() << "{" << endl;
-                    indent_up();
-                }
-            }
-            out << indent() << "field.Name = \"" << (*f_iter)->get_name() << "\";" << endl
-                << indent() << "field.Type = " << type_to_enum((*f_iter)->get_type()) << ";" << endl
-                << indent() << "field.ID = " << (*f_iter)->get_key() << ";" << endl
-                << indent() << "await oprot.WriteFieldBeginAsync(field, cancellationToken);" << endl;
+            generate_null_check_begin( out, *f_iter);
+            out << indent() << tmpvar << ".Name = \"" << (*f_iter)->get_name() << "\";" << endl
+                << indent() << tmpvar << ".Type = " << type_to_enum((*f_iter)->get_type()) << ";" << endl
+                << indent() << tmpvar << ".ID = " << (*f_iter)->get_key() << ";" << endl
+                << indent() << "await oprot.WriteFieldBeginAsync(" << tmpvar << ", " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
             generate_serialize_field(out, *f_iter);
 
-            out << indent() << "await oprot.WriteFieldEndAsync(cancellationToken);" << endl;
-            if (!is_required)
-            {
-                indent_down();
-                out << indent() << "}" << endl;
-            }
+            out << indent() << "await oprot.WriteFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+            generate_null_check_end(out, *f_iter);
         }
     }
 
-    out << indent() << "await oprot.WriteFieldStopAsync(cancellationToken);" << endl
-        << indent() << "await oprot.WriteStructEndAsync(cancellationToken);" << endl;
+    out << indent() << "await oprot.WriteFieldStopAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.WriteStructEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     indent_down();
     out << indent() << "}" << endl
         << indent() << "finally" << endl
@@ -1111,7 +1366,7 @@ void t_netstd_generator::generate_netstd_struct_writer(ostream& out, t_struct* t
 
 void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_struct* tstruct)
 {
-    out << indent() << "public async Task WriteAsync(TProtocol oprot, CancellationToken cancellationToken)" << endl
+    out << indent() << "public async global::System.Threading.Tasks.Task WriteAsync(TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl
         << indent() << "{" << endl;
     indent_up();
 
@@ -1124,12 +1379,14 @@ void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_st
     const vector<t_field*>& fields = tstruct->get_sorted_members();
     vector<t_field*>::const_iterator f_iter;
 
-    out << indent() << "var struc = new TStruct(\"" << name << "\");" << endl
-        << indent() << "await oprot.WriteStructBeginAsync(struc, cancellationToken);" << endl;
+    string tmpvar = tmp("tmp");
+    out << indent() << "var " << tmpvar << " = new TStruct(\"" << name << "\");" << endl
+        << indent() << "await oprot.WriteStructBeginAsync(" << tmpvar << ", " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
     if (fields.size() > 0)
     {
-        out << indent() << "var field = new TField();" << endl;
+        tmpvar = tmp("tmp");
+        out << indent() << "var " << tmpvar << " = new TField();" << endl;
         bool first = true;
         for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
         {
@@ -1143,7 +1400,7 @@ void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_st
                 out << indent() << "else if";
             }
 
-            out << "(this.__isset." << normalize_name((*f_iter)->get_name()) << ")" << endl
+            out << "(this.__isset." << get_isset_name(normalize_name((*f_iter)->get_name())) << ")" << endl
                 << indent() << "{" << endl;
             indent_up();
 
@@ -1155,14 +1412,14 @@ void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_st
                 indent_up();
             }
 
-            out << indent() << "field.Name = \"" << prop_name(*f_iter) << "\";" << endl
-                << indent() << "field.Type = " << type_to_enum((*f_iter)->get_type()) << ";" << endl
-                << indent() << "field.ID = " << (*f_iter)->get_key() << ";" << endl
-                << indent() << "await oprot.WriteFieldBeginAsync(field, cancellationToken);" << endl;
+            out << indent() << tmpvar << ".Name = \"" << prop_name(*f_iter) << "\";" << endl
+                << indent() << tmpvar << ".Type = " << type_to_enum((*f_iter)->get_type()) << ";" << endl
+                << indent() << tmpvar << ".ID = " << (*f_iter)->get_key() << ";" << endl
+                << indent() << "await oprot.WriteFieldBeginAsync(" << tmpvar << ", " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
             generate_serialize_field(out, *f_iter);
 
-            out << indent() << "await oprot.WriteFieldEndAsync(cancellationToken);" << endl;
+            out << indent() << "await oprot.WriteFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
 
             if (null_allowed)
             {
@@ -1175,8 +1432,8 @@ void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_st
         }
     }
 
-    out << indent() << "await oprot.WriteFieldStopAsync(cancellationToken);" << endl
-        << indent() << "await oprot.WriteStructEndAsync(cancellationToken);" << endl;
+    out << indent() << "await oprot.WriteFieldStopAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.WriteStructEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     indent_down();
     out << indent() << "}" << endl
         << indent() << "finally" << endl
@@ -1191,20 +1448,22 @@ void t_netstd_generator::generate_netstd_struct_result_writer(ostream& out, t_st
 
 void t_netstd_generator::generate_netstd_struct_tostring(ostream& out, t_struct* tstruct)
 {
+    string tmpvar = tmp("tmp");
     out << indent() << "public override string ToString()" << endl
         << indent() << "{" << endl;
     indent_up();
-    out << indent() << "var sb = new StringBuilder(\"" << tstruct->get_name() << "(\");" << endl;
+    out << indent() << "var " << tmpvar << " = new StringBuilder(\"" << tstruct->get_name() << "(\");" << endl;
 
     const vector<t_field*>& fields = tstruct->get_members();
     vector<t_field*>::const_iterator f_iter;
 
     bool useFirstFlag = false;
+    string tmp_count = tmp("tmp");
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
         if (!field_is_required((*f_iter)))
         {
-            out << indent() << "bool __first = true;" << endl;
+            out << indent() << "int " << tmp_count.c_str() << " = 0;" << endl;
             useFirstFlag = true;
         }
         break;
@@ -1214,53 +1473,29 @@ void t_netstd_generator::generate_netstd_struct_tostring(ostream& out, t_struct*
 
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
-        bool is_required = field_is_required((*f_iter));
-        if (!is_required)
-        {
-            bool null_allowed = type_can_be_null((*f_iter)->get_type());
-            if (null_allowed)
-            {
-                out << indent() << "if (" << prop_name((*f_iter)) << " != null && __isset." << normalize_name((*f_iter)->get_name()) << ")" << endl
-                    << indent() << "{" << endl;
-                indent_up();
-            }
-            else
-            {
-                out << indent() << "if (__isset." << normalize_name((*f_iter)->get_name()) << ")" << endl
-                    << indent() << "{" << endl;
-                indent_up();
-            }
-        }
+        bool is_required = field_is_required(*f_iter);
+        generate_null_check_begin(out, *f_iter);
 
         if (useFirstFlag && (!had_required))
         {
-            out << indent() << "if(!__first) { sb.Append(\", \"); }" << endl;
-            if (!is_required)
-            {
-                out << indent() << "__first = false;" << endl;
-            }
-            out << indent() << "sb.Append(\"" << prop_name(*f_iter) << ": \");" << endl;
+            out << indent() << "if(0 < " << tmp_count.c_str() << (is_required ? "" : "++") << ") { " << tmpvar << ".Append(\", \"); }" << endl;
+            out << indent() << tmpvar << ".Append(\"" << prop_name(*f_iter) << ": \");" << endl;
         }
         else
         {
-            out << indent() << "sb.Append(\", " << prop_name(*f_iter) << ": \");" << endl;
+            out << indent() << tmpvar << ".Append(\", " << prop_name(*f_iter) << ": \");" << endl;
         }
 
-        out << indent() << prop_name(*f_iter) << ".ToString(sb);" << endl;
+        out << indent() << prop_name(*f_iter) << ".ToString(" << tmpvar << ");" << endl;
 
-        if (!is_required)
-        {
-            indent_down();
-            out << indent() << "}" << endl;
-        }
-        else
-        {
-            had_required = true; // now __first must be false, so we don't need to check it anymore
+        generate_null_check_end(out, *f_iter);
+        if (is_required) {
+            had_required = true; // now __count must be > 0, so we don't need to check it anymore
         }
     }
 
-    out << indent() << "sb.Append(\")\");" << endl
-        << indent() << "return sb.ToString();" << endl;
+    out << indent() << tmpvar << ".Append(')');" << endl
+        << indent() << "return " << tmpvar << ".ToString();" << endl;
     indent_down();
     out << indent() << "}" << endl;
 }
@@ -1274,6 +1509,7 @@ void t_netstd_generator::generate_netstd_union(t_struct* tunion)
 
     f_union.open(f_union_name.c_str());
 
+    reset_indent();
     f_union << autogen_comment() << netstd_type_usings() << netstd_thrift_usings() << endl;
 
     generate_netstd_union_definition(f_union, tunion);
@@ -1288,11 +1524,11 @@ void t_netstd_generator::generate_netstd_union_definition(ostream& out, t_struct
     // Let's define the class first
     start_netstd_namespace(out);
 
-    out << indent() << "public abstract partial class " << tunion->get_name() << " : TUnionBase" << endl
-        << indent() << "{" << endl;
+    out << indent() << "public abstract partial class " << tunion->get_name() << " : TUnionBase" << endl;
+    out << indent() << "{" << endl;
     indent_up();
 
-    out << indent() << "public abstract Task WriteAsync(TProtocol tProtocol, CancellationToken cancellationToken);" << endl
+    out << indent() << "public abstract global::System.Threading.Tasks.Task WriteAsync(TProtocol tProtocol, CancellationToken " << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "public readonly int Isset;" << endl
         << indent() << "public abstract object Data { get; }" << endl
         << indent() << "protected " << tunion->get_name() << "(int isset)" << endl
@@ -1302,14 +1538,107 @@ void t_netstd_generator::generate_netstd_union_definition(ostream& out, t_struct
     indent_down();
     out << indent() << "}" << endl << endl;
 
-    out << indent() << "public class ___undefined : " << tunion->get_name() << endl
-        << indent() << "{" << endl;
+    const vector<t_field*>& fields = tunion->get_members();
+    vector<t_field*>::const_iterator f_iter;
+
+    out << indent() << "public override bool Equals(object that)" << endl;
+    scope_up(out);
+    out << indent() << "if (!(that is " << tunion->get_name() << " other)) return false;" << endl;
+    out << indent() << "if (ReferenceEquals(this, other)) return true;" << endl;
+    out << endl;
+    out << indent() << "if(this.Isset != other.Isset) return false;" << endl;
+    out << endl;
+    out << indent() << "switch (Isset)" << endl;
+    scope_up(out);
+    for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
+    {
+        bool needs_typecast = false;
+        string copy_op = get_deep_copy_method_call((*f_iter)->get_type(), needs_typecast);
+        out << indent() << "case " << (*f_iter)->get_key() << ":" << endl;
+        indent_up();
+        out << indent() << "return Equals(As_" << (*f_iter)->get_name() << ", other.As_" << (*f_iter)->get_name() << ");" << endl;
+        indent_down();
+    }
+    out << indent() << "default:" << endl;
+    indent_up();
+    out << indent() << "return true;" << endl;
+    indent_down();
+    indent_down();
+    scope_down(out);
+    scope_down(out);
+    out << endl;
+
+    out << indent() << "public override int GetHashCode()" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+    out << indent() << "switch (Isset)" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+    for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
+    {
+        bool needs_typecast = false;
+        string copy_op = get_deep_copy_method_call((*f_iter)->get_type(), needs_typecast);
+        out << indent() << "case " << (*f_iter)->get_key() << ":" << endl;
+        indent_up();
+        out << indent() << "return As_" << (*f_iter)->get_name() << ".GetHashCode();" << endl;
+        indent_down();
+    }
+    out << indent() << "default:" << endl;
+    indent_up();
+    out << indent() << "return (new ___undefined()).GetHashCode();" << endl;
+    indent_down();
+    indent_down();
+    out << indent() << "}" << endl;
+    indent_down();
+    out << indent() << "}" << endl << endl;
+
+    if( ! suppress_deepcopy) {
+        out << indent() << "public " << tunion->get_name() << " DeepCopy()" << endl;
+        out << indent() << "{" << endl;
+        indent_up();
+        out << indent() << "switch (Isset)" << endl;
+        out << indent() << "{" << endl;
+        indent_up();
+        for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
+        {
+            bool needs_typecast = false;
+            string copy_op = get_deep_copy_method_call((*f_iter)->get_type(), needs_typecast);
+            out << indent() << "case " << (*f_iter)->get_key() << ":" << endl;
+            indent_up();
+            out << indent() << "return new " << (*f_iter)->get_name() << "(As_" << (*f_iter)->get_name() << copy_op << ");" << endl;
+            indent_down();
+        }
+        out << indent() << "default:" << endl;
+        indent_up();
+        out << indent() << "return new ___undefined();" << endl;
+        indent_down();
+        indent_down();
+        out << indent() << "}" << endl;
+        indent_down();
+        out << indent() << "}" << endl << endl;
+    }
+
+    out << indent() << "public class ___undefined : " << tunion->get_name() << endl;
+    out << indent() << "{" << endl;
     indent_up();
 
     out << indent() << "public override object Data { get { return null; } }" << endl
         << indent() << "public ___undefined() : base(0) {}" << endl << endl;
 
-    out << indent() << "public override Task WriteAsync(TProtocol oprot, CancellationToken cancellationToken)" << endl
+    if( ! suppress_deepcopy) {
+        out << indent() << "public new ___undefined DeepCopy()" << endl;
+        out << indent() << "{" << endl;
+        indent_up();
+        out << indent() << "return new ___undefined();" << endl;
+        indent_down();
+        out << indent() << "}" << endl << endl;
+    }
+
+    t_struct undefined_struct(program_,"___undefined");
+    generate_netstd_struct_equals(out, &undefined_struct);
+    generate_netstd_struct_hashcode(out, &undefined_struct);
+
+    out << indent() << "public override global::System.Threading.Tasks.Task WriteAsync(TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl
         << indent() << "{" << endl;
     indent_up();
     out << indent() << "throw new TProtocolException( TProtocolException.INVALID_DATA, \"Cannot persist an union type which is not set.\");" << endl;
@@ -1317,9 +1646,6 @@ void t_netstd_generator::generate_netstd_union_definition(ostream& out, t_struct
     out << indent() << "}" << endl << endl;
     indent_down();
     out << indent() << "}" << endl << endl;
-
-    const vector<t_field*>& fields = tunion->get_members();
-    vector<t_field*>::const_iterator f_iter;
 
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
@@ -1348,10 +1674,10 @@ void t_netstd_generator::generate_netstd_union_class(ostream& out, t_struct* tun
     indent_down();
     out << indent() << "}" << endl
         << endl;
-    
-    
-    out << indent() << "public class " << tfield->get_name() << " : " << tunion->get_name() << endl
-        << indent() << "{" << endl;
+
+
+    out << indent() << "public class " << tfield->get_name() << " : " << tunion->get_name() << endl;
+    out << indent() << "{" << endl;
     indent_up();
 
     out << indent() << "private " << type_name(tfield->get_type()) << " _data;" << endl
@@ -1363,7 +1689,35 @@ void t_netstd_generator::generate_netstd_union_class(ostream& out, t_struct* tun
     indent_down();
     out << indent() << "}" << endl;
 
-    out << indent() << "public override async Task WriteAsync(TProtocol oprot, CancellationToken cancellationToken) {" << endl;
+    if( ! suppress_deepcopy) {
+        out << indent() << "public new " << tfield->get_name() << " DeepCopy()" << endl;
+        out << indent() << "{" << endl;
+        indent_up();
+        bool needs_typecast = false;
+        string copy_op = get_deep_copy_method_call(tfield->get_type(), needs_typecast);
+        out << indent() << "return new " << tfield->get_name() << "(_data" << copy_op << ");" << endl;
+        indent_down();
+        out << indent() << "}" << endl << endl;
+    }
+
+    out << indent() << "public override bool Equals(object that)" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+    out << indent() << "if (!(that is " << tunion->get_name() << " other)) return false;" << endl;
+    out << indent() << "if (ReferenceEquals(this, other)) return true;" << endl;
+    out << endl;
+    out << indent() << "return Equals( _data, other.As_" << tfield->get_name() << ");" << endl;
+    indent_down();
+    out << indent() << "}" << endl << endl;
+
+    out << indent() << "public override int GetHashCode()" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+    out << indent() << "return _data.GetHashCode();" << endl;
+    indent_down();
+    out << indent() << "}" << endl << endl;
+
+    out << indent() << "public override async global::System.Threading.Tasks.Task WriteAsync(TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ") {" << endl;
     indent_up();
 
     out << indent() << "oprot.IncrementRecursionDepth();" << endl
@@ -1372,19 +1726,19 @@ void t_netstd_generator::generate_netstd_union_class(ostream& out, t_struct* tun
     indent_up();
 
     out << indent() << "var struc = new TStruct(\"" << tunion->get_name() << "\");" << endl
-        << indent() << "await oprot.WriteStructBeginAsync(struc, cancellationToken);" << endl;
+        << indent() << "await oprot.WriteStructBeginAsync(struc, " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
     out << indent() << "var field = new TField();" << endl
         << indent() << "field.Name = \"" << tfield->get_name() << "\";" << endl
         << indent() << "field.Type = " << type_to_enum(tfield->get_type()) << ";" << endl
         << indent() << "field.ID = " << tfield->get_key() << ";" << endl
-        << indent() << "await oprot.WriteFieldBeginAsync(field, cancellationToken);" << endl;
+        << indent() << "await oprot.WriteFieldBeginAsync(field, " << CANCELLATION_TOKEN_NAME << ");" << endl;
 
     generate_serialize_field(out, tfield, "_data", true);
 
-    out << indent() << "await oprot.WriteFieldEndAsync(cancellationToken);" << endl
-        << indent() << "await oprot.WriteFieldStopAsync(cancellationToken);" << endl
-        << indent() << "await oprot.WriteStructEndAsync(cancellationToken);" << endl;
+    out << indent() << "await oprot.WriteFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.WriteFieldStopAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.WriteStructEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     indent_down();
     out << indent() << "}" << endl
         << indent() << "finally" << endl
@@ -1393,6 +1747,7 @@ void t_netstd_generator::generate_netstd_union_class(ostream& out, t_struct* tun
     out << indent() << "oprot.DecrementRecursionDepth();" << endl;
     indent_down();
     out << indent() << "}" << endl;
+    indent_down();
     out << indent() << "}" << endl;
     indent_down();
     out << indent() << "}" << endl << endl;
@@ -1403,9 +1758,9 @@ void t_netstd_generator::generate_netstd_struct_equals(ostream& out, t_struct* t
     out << indent() << "public override bool Equals(object that)" << endl
         << indent() << "{" << endl;
     indent_up();
-    out << indent() << "var other = that as " << check_and_correct_struct_name(normalize_name(tstruct->get_name())) << ";" << endl
-        << indent() << "if (other == null) return false;" << endl
+    out << indent() << "if (!(that is " << type_name(tstruct,false) << " other)) return false;" << endl
         << indent() << "if (ReferenceEquals(this, other)) return true;" << endl;
+
 
     const vector<t_field*>& fields = tstruct->get_members();
     vector<t_field*>::const_iterator f_iter;
@@ -1427,9 +1782,9 @@ void t_netstd_generator::generate_netstd_struct_equals(ostream& out, t_struct* t
         }
         if (!field_is_required((*f_iter)))
         {
-            out << "((__isset." << normalize_name((*f_iter)->get_name()) << " == other.__isset."
-                << normalize_name((*f_iter)->get_name()) << ") && ((!__isset."
-                << normalize_name((*f_iter)->get_name()) << ") || (";
+            out << "((__isset." << get_isset_name(normalize_name((*f_iter)->get_name())) << " == other.__isset."
+                << get_isset_name(normalize_name((*f_iter)->get_name())) << ") && ((!__isset."
+                << get_isset_name(normalize_name((*f_iter)->get_name())) << ") || (";
         }
         t_type* ttype = (*f_iter)->get_type();
         if (ttype->is_container() || ttype->is_binary())
@@ -1475,26 +1830,18 @@ void t_netstd_generator::generate_netstd_struct_hashcode(ostream& out, t_struct*
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
         t_type* ttype = (*f_iter)->get_type();
-        if (!field_is_required((*f_iter)))
-        {
-            out << indent() << "if(__isset." << normalize_name((*f_iter)->get_name()) << ")" << endl;
-            indent_up();
-        }
+
+        generate_null_check_begin(out, *f_iter);
         out << indent() << "hashcode = (hashcode * 397) + ";
-        if (ttype->is_container())
-        {
+        if (ttype->is_container()) {
             out << "TCollections.GetHashCode(" << prop_name((*f_iter)) << ")";
         }
-        else
-        {
+        else {
             out << prop_name((*f_iter)) << ".GetHashCode()";
-        }	
+        }
         out << ";" << endl;
 
-        if (!field_is_required((*f_iter)))
-        {
-            indent_down();
-        }
+        generate_null_check_end(out, *f_iter);
     }
 
     indent_down();
@@ -1513,6 +1860,7 @@ void t_netstd_generator::generate_service(t_service* tservice)
     ofstream_with_content_based_conditional_update f_service;
     f_service.open(f_service_name.c_str());
 
+    reset_indent();
     f_service << autogen_comment() << netstd_type_usings() << netstd_thrift_usings() << endl;
 
     start_netstd_namespace(f_service);
@@ -1539,7 +1887,7 @@ void t_netstd_generator::generate_service_interface(ostream& out, t_service* tse
 {
     string extends = "";
     string extends_iface = "";
-    if (tservice->get_extends() != NULL)
+    if (tservice->get_extends() != nullptr)
     {
         extends = type_name(tservice->get_extends());
         extends_iface = " : " + extends + ".IAsync";
@@ -1554,6 +1902,7 @@ void t_netstd_generator::generate_service_interface(ostream& out, t_service* tse
         out << indent() << "[ServiceContract(Namespace=\"" << wcf_namespace_ << "\")]" << endl;
     }
 
+    prepare_member_name_mapping(tservice);
     out << indent() << "public interface IAsync" << extends_iface << endl
         << indent() << "{" << endl;
 
@@ -1577,10 +1926,21 @@ void t_netstd_generator::generate_service_interface(ostream& out, t_service* tse
             }
         }
 
+        auto iter = (*f_iter)->annotations_.find("deprecated");
+        if( (*f_iter)->annotations_.end() != iter) {
+          out << indent() << "[Obsolete";
+          // empty annotation values end up with "1" somewhere, ignore these as well
+          if ((iter->second.length() > 0) && (iter->second != "1")) {
+            out << "(" << make_csharp_string_literal(iter->second) << ")";
+          }
+          out << "]" << endl;
+        }
+
         out << indent() << function_signature_async(*f_iter) << ";" << endl << endl;
     }
     indent_down();
     out << indent() << "}" << endl << endl;
+    cleanup_member_name_mapping(tservice);
 }
 
 void t_netstd_generator::generate_service_helpers(ostream& out, t_service* tservice)
@@ -1588,19 +1948,29 @@ void t_netstd_generator::generate_service_helpers(ostream& out, t_service* tserv
     vector<t_function*> functions = tservice->get_functions();
     vector<t_function*>::iterator f_iter;
 
+    prepare_member_name_mapping(tservice);
+    out << indent() << "public class InternalStructs" << endl;
+    out << indent() << "{" << endl;
+    indent_up();
+
     for (f_iter = functions.begin(); f_iter != functions.end(); ++f_iter)
     {
         t_struct* ts = (*f_iter)->get_arglist();
+        collect_extensions_types(ts);
         generate_netstd_struct_definition(out, ts, false, true);
         generate_function_helpers(out, *f_iter);
     }
+
+    indent_down();
+    out << indent() << "}" << endl << endl;
+    cleanup_member_name_mapping(tservice);
 }
 
 void t_netstd_generator::generate_service_client(ostream& out, t_service* tservice)
 {
     string extends = "";
     string extends_client = "";
-    if (tservice->get_extends() != NULL)
+    if (tservice->get_extends() != nullptr)
     {
         extends = type_name(tservice->get_extends());
         extends_client = extends + ".Client, ";
@@ -1613,7 +1983,7 @@ void t_netstd_generator::generate_service_client(ostream& out, t_service* tservi
     out << endl;
 
     generate_netstd_doc(out, tservice);
-
+    prepare_member_name_mapping(tservice);
     out << indent() << "public class Client : " << extends_client << "IAsync" << endl
         << indent() << "{" << endl;
     indent_up();
@@ -1622,74 +1992,113 @@ void t_netstd_generator::generate_service_client(ostream& out, t_service* tservi
         << indent() << "{" << endl
         << indent() << "}" << endl
         << endl
-        << indent() << "public Client(TProtocol inputProtocol, TProtocol outputProtocol) : base(inputProtocol, outputProtocol)"
+        << indent() << "public Client(TProtocol inputProtocol, TProtocol outputProtocol) : base(inputProtocol, outputProtocol)" << endl
         << indent() << "{" << endl
-        << indent() << "}" << endl;
+        << indent() << "}" << endl
+        << endl;
 
     vector<t_function*> functions = tservice->get_functions();
     vector<t_function*>::const_iterator functions_iterator;
 
     for (functions_iterator = functions.begin(); functions_iterator != functions.end(); ++functions_iterator)
     {
-        string function_name = correct_function_name_for_async((*functions_iterator)->get_name());
+        string raw_func_name = (*functions_iterator)->get_name();
+        string function_name = raw_func_name + (add_async_postfix ? "Async" : "");
 
         // async
         out << indent() << "public async " << function_signature_async(*functions_iterator, "") << endl
             << indent() << "{" << endl;
         indent_up();
+        out << indent() << "await send_" << function_name << "(";
+        string call_args = argument_list((*functions_iterator)->get_arglist(),false);
+        if(! call_args.empty()) {
+            out << call_args << ", ";
+        }
+        out << CANCELLATION_TOKEN_NAME << ");" << endl;
+        if(! (*functions_iterator)->is_oneway()) {
+            out << indent() << ((*functions_iterator)->get_returntype()->is_void() ? "" : "return ")
+                            << "await recv_" << function_name << "(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+        }
+        indent_down();
+        out << indent() << "}" << endl << endl;
 
-        string argsname = (*functions_iterator)->get_name() + "Args";
+        // async send
+        out << indent() << "public async " << function_signature_async(*functions_iterator, "send_", MODE_NO_RETURN) << endl
+            << indent() << "{" << endl;
+        indent_up();
 
-        out << indent() << "await OutputProtocol.WriteMessageBeginAsync(new TMessage(\"" << function_name
-            << "\", " << ((*functions_iterator)->is_oneway() ? "TMessageType.Oneway" : "TMessageType.Call") << ", SeqId), cancellationToken);" << endl
+        string tmpvar = tmp("tmp");
+        string argsname = (*functions_iterator)->get_name() + "_args";
+
+        out << indent() << "await OutputProtocol.WriteMessageBeginAsync(new TMessage(\"" << raw_func_name
+            << "\", TMessageType." << ((*functions_iterator)->is_oneway() ? "Oneway" : "Call")
+            << ", SeqId), " << CANCELLATION_TOKEN_NAME << ");" << endl
             << indent() << endl
-            << indent() << "var args = new " << argsname << "();" << endl;
+            << indent() << "var " << tmpvar << " = new InternalStructs." << argsname << "() {" << endl;
+        indent_up();
 
         t_struct* arg_struct = (*functions_iterator)->get_arglist();
+        collect_extensions_types(arg_struct);
         prepare_member_name_mapping(arg_struct);
         const vector<t_field*>& fields = arg_struct->get_members();
         vector<t_field*>::const_iterator fld_iter;
 
         for (fld_iter = fields.begin(); fld_iter != fields.end(); ++fld_iter)
         {
-            out << indent() << "args." << prop_name(*fld_iter) << " = " << normalize_name((*fld_iter)->get_name()) << ";" << endl;
+            out << indent() << prop_name(*fld_iter) << " = " << normalize_name((*fld_iter)->get_name(),true) << "," << endl;
         }
 
+        indent_down();
+        out << indent() << "};" << endl;
+
+
         out << indent() << endl
-            << indent() << "await args.WriteAsync(OutputProtocol, cancellationToken);" << endl
-            << indent() << "await OutputProtocol.WriteMessageEndAsync(cancellationToken);" << endl
-            << indent() << "await OutputProtocol.Transport.FlushAsync(cancellationToken);" << endl;
+            << indent() << "await " << tmpvar << ".WriteAsync(OutputProtocol, " << CANCELLATION_TOKEN_NAME << ");" << endl
+            << indent() << "await OutputProtocol.WriteMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+            << indent() << "await OutputProtocol.Transport.FlushAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+
+        indent_down();
+        out << indent() << "}" << endl << endl;
 
         if (!(*functions_iterator)->is_oneway())
         {
-            string resultname = (*functions_iterator)->get_name() + "Result";
-            t_struct noargs(program_);
-            t_struct* xs = (*functions_iterator)->get_xceptions();
-            prepare_member_name_mapping(xs, xs->get_members(), resultname);
-
-            out << indent() << endl
-                << indent() << "var msg = await InputProtocol.ReadMessageBeginAsync(cancellationToken);" << endl
-                << indent() << "if (msg.Type == TMessageType.Exception)" << endl
+            // async recv
+            out << indent() << "public async " << function_signature_async(*functions_iterator, "recv_", MODE_NO_ARGS) << endl
                 << indent() << "{" << endl;
             indent_up();
 
-            out << indent() << "var x = await TApplicationException.ReadAsync(InputProtocol, cancellationToken);" << endl
-                << indent() << "await InputProtocol.ReadMessageEndAsync(cancellationToken);" << endl
-                << indent() << "throw x;" << endl;
+            string resultname = (*functions_iterator)->get_name() + "_result";
+            t_struct noargs(program_);
+            t_struct* xs = (*functions_iterator)->get_xceptions();
+            collect_extensions_types(xs);
+            prepare_member_name_mapping(xs, xs->get_members(), resultname);
+
+            tmpvar = tmp("tmp");
+            out << indent() << endl
+                << indent() << "var " << tmpvar << " = await InputProtocol.ReadMessageBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+                << indent() << "if (" << tmpvar << ".Type == TMessageType.Exception)" << endl
+                << indent() << "{" << endl;
+            indent_up();
+
+            tmpvar = tmp("tmp");
+            out << indent() << "var " << tmpvar << " = await TApplicationException.ReadAsync(InputProtocol, " << CANCELLATION_TOKEN_NAME << ");" << endl
+                << indent() << "await InputProtocol.ReadMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+                << indent() << "throw " << tmpvar << ";" << endl;
             indent_down();
 
+            tmpvar = tmp("tmp");
             out << indent() << "}" << endl
                 << endl
-                << indent() << "var result = new " << resultname << "();" << endl
-                << indent() << "await result.ReadAsync(InputProtocol, cancellationToken);" << endl
-                << indent() << "await InputProtocol.ReadMessageEndAsync(cancellationToken);" << endl;
+                << indent() << "var " << tmpvar << " = new InternalStructs." << resultname << "();" << endl
+                << indent() << "await " << tmpvar << ".ReadAsync(InputProtocol, " << CANCELLATION_TOKEN_NAME << ");" << endl
+                << indent() << "await InputProtocol.ReadMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
 
             if (!(*functions_iterator)->get_returntype()->is_void())
             {
-                out << indent() << "if (result.__isset.success)" << endl
+                out << indent() << "if (" << tmpvar << ".__isset.success)" << endl
                     << indent() << "{" << endl;
                 indent_up();
-                out << indent() << "return result.Success;" << endl;
+                out << indent() << "return " << tmpvar << ".Success;" << endl;
                 indent_down();
                 out << indent() << "}" << endl;
             }
@@ -1698,37 +2107,31 @@ void t_netstd_generator::generate_service_client(ostream& out, t_service* tservi
             vector<t_field*>::const_iterator x_iter;
             for (x_iter = xceptions.begin(); x_iter != xceptions.end(); ++x_iter)
             {
-                out << indent() << "if (result.__isset." << normalize_name((*x_iter)->get_name()) << ")" << endl
+                out << indent() << "if (" << tmpvar << ".__isset." << get_isset_name(normalize_name((*x_iter)->get_name())) << ")" << endl
                     << indent() << "{" << endl;
                 indent_up();
-                out << indent() << "throw result." << prop_name(*x_iter) << ";" << endl;
+                out << indent() << "throw " << tmpvar << "." << prop_name(*x_iter) << ";" << endl;
                 indent_down();
                 out << indent() << "}" << endl;
             }
 
-            if ((*functions_iterator)->get_returntype()->is_void())
-            {
-                out << indent() << "return;" << endl;
-            }
-            else
+            if (!(*functions_iterator)->get_returntype()->is_void())
             {
                 out << indent() << "throw new TApplicationException(TApplicationException.ExceptionType.MissingResult, \""
                     << function_name << " failed: unknown result\");" << endl;
             }
 
-            cleanup_member_name_mapping((*functions_iterator)->get_xceptions());
+            cleanup_member_name_mapping(xs);
             indent_down();
             out << indent() << "}" << endl << endl;
         }
-        else
-        {
-            indent_down();
-            out << indent() << "}" << endl;
-        }
+
+        cleanup_member_name_mapping(arg_struct);
     }
 
     indent_down();
     out << indent() << "}" << endl << endl;
+    cleanup_member_name_mapping(tservice);
 }
 
 void t_netstd_generator::generate_service_server(ostream& out, t_service* tservice)
@@ -1738,20 +2141,22 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
 
     string extends = "";
     string extends_processor = "";
-    if (tservice->get_extends() != NULL)
+    if (tservice->get_extends() != nullptr)
     {
         extends = type_name(tservice->get_extends());
         extends_processor = extends + ".AsyncProcessor, ";
     }
 
+    prepare_member_name_mapping(tservice);
     out << indent() << "public class AsyncProcessor : " << extends_processor << "ITAsyncProcessor" << endl
         << indent() << "{" << endl;
 
     indent_up();
 
-    out << indent() << "private IAsync _iAsync;" << endl
+    out << indent() << "private readonly IAsync _iAsync;" << endl
+        << indent() << "private readonly ILogger<AsyncProcessor> _logger;" << endl
         << endl
-        << indent() << "public AsyncProcessor(IAsync iAsync)";
+        << indent() << "public AsyncProcessor(IAsync iAsync, ILogger<AsyncProcessor> logger = default)";
 
     if (!extends.empty())
     {
@@ -1762,14 +2167,12 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
         << indent() << "{" << endl;
     indent_up();
 
-    out << indent() << "if (iAsync == null) throw new ArgumentNullException(nameof(iAsync));" << endl
-        << endl
-        << indent() << "_iAsync = iAsync;" << endl;
-
+    out << indent() << "_iAsync = iAsync ?? throw new ArgumentNullException(nameof(iAsync));" << endl;
+    out << indent() << "_logger = logger;" << endl;
     for (f_iter = functions.begin(); f_iter != functions.end(); ++f_iter)
     {
-        string function_name = (*f_iter)->get_name();
-        out << indent() << "processMap_[\"" << correct_function_name_for_async(function_name) << "\"] = " << function_name << "_ProcessAsync;" << endl;
+        string raw_func_name = (*f_iter)->get_name();
+        out << indent() << "processMap_[\"" << raw_func_name << "\"] = " << raw_func_name << "_ProcessAsync;" << endl;
     }
 
     indent_down();
@@ -1778,7 +2181,7 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
 
     if (extends.empty())
     {
-        out << indent() << "protected delegate Task ProcessFunction(int seqid, TProtocol iprot, TProtocol oprot, CancellationToken cancellationToken);" << endl;
+        out << indent() << "protected delegate global::System.Threading.Tasks.Task ProcessFunction(int seqid, TProtocol iprot, TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 
     if (extends.empty())
@@ -1797,7 +2200,7 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
         indent_down();
         out << indent() << "}" << endl << endl;
 
-        out << indent() << "public async Task<bool> ProcessAsync(TProtocol iprot, TProtocol oprot, CancellationToken cancellationToken)" << endl;
+        out << indent() << "public async Task<bool> ProcessAsync(TProtocol iprot, TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl;
     }
     else
     {
@@ -1808,7 +2211,7 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
         indent_down();
         out << indent() << "}" << endl << endl;
 
-        out << indent() << "public new async Task<bool> ProcessAsync(TProtocol iprot, TProtocol oprot, CancellationToken cancellationToken)" << endl;
+        out << indent() << "public new async Task<bool> ProcessAsync(TProtocol iprot, TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl;
     }
 
     out << indent() << "{" << endl;
@@ -1816,26 +2219,25 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
     out << indent() << "try" << endl
         << indent() << "{" << endl;
     indent_up();
-    out << indent() << "var msg = await iprot.ReadMessageBeginAsync(cancellationToken);" << endl
+    out << indent() << "var msg = await iprot.ReadMessageBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
         << endl
-        << indent() << "ProcessFunction fn;" << endl
-        << indent() << "processMap_.TryGetValue(msg.Name, out fn);" << endl
+        << indent() << "processMap_.TryGetValue(msg.Name, out ProcessFunction fn);" << endl
         << endl
         << indent() << "if (fn == null)" << endl
         << indent() << "{" << endl;
     indent_up();
-    out << indent() << "await TProtocolUtil.SkipAsync(iprot, TType.Struct, cancellationToken);" << endl
-        << indent() << "await iprot.ReadMessageEndAsync(cancellationToken);" << endl
+    out << indent() << "await TProtocolUtil.SkipAsync(iprot, TType.Struct, " << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await iprot.ReadMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "var x = new TApplicationException (TApplicationException.ExceptionType.UnknownMethod, \"Invalid method name: '\" + msg.Name + \"'\");" << endl
-        << indent() << "await oprot.WriteMessageBeginAsync(new TMessage(msg.Name, TMessageType.Exception, msg.SeqID), cancellationToken);" << endl
-        << indent() << "await x.WriteAsync(oprot, cancellationToken);" << endl
-        << indent() << "await oprot.WriteMessageEndAsync(cancellationToken);" << endl
-        << indent() << "await oprot.Transport.FlushAsync(cancellationToken);" << endl
+        << indent() << "await oprot.WriteMessageBeginAsync(new TMessage(msg.Name, TMessageType.Exception, msg.SeqID), " << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await x.WriteAsync(oprot, " << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.WriteMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await oprot.Transport.FlushAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
         << indent() << "return true;" << endl;
     indent_down();
     out << indent() << "}" << endl
         << endl
-        << indent() << "await fn(msg.SeqID, iprot, oprot, cancellationToken);" << endl
+        << indent() << "await fn(msg.SeqID, iprot, oprot, " << CANCELLATION_TOKEN_NAME << ");" << endl
         << endl;
     indent_down();
     out << indent() << "}" << endl;
@@ -1857,6 +2259,7 @@ void t_netstd_generator::generate_service_server(ostream& out, t_service* tservi
 
     indent_down();
     out << indent() << "}" << endl << endl;
+    cleanup_member_name_mapping(tservice);
 }
 
 void t_netstd_generator::generate_function_helpers(ostream& out, t_function* tfunction)
@@ -1881,27 +2284,30 @@ void t_netstd_generator::generate_function_helpers(ostream& out, t_function* tfu
         result.append(*f_iter);
     }
 
+    collect_extensions_types(&result);
     generate_netstd_struct_definition(out, &result, false, true, true);
 }
 
 void t_netstd_generator::generate_process_function_async(ostream& out, t_service* tservice, t_function* tfunction)
 {
     (void)tservice;
-    out << indent() << "public async Task " << tfunction->get_name()
-        << "_ProcessAsync(int seqid, TProtocol iprot, TProtocol oprot, CancellationToken cancellationToken)" << endl
+    out << indent() << "public async global::System.Threading.Tasks.Task " << tfunction->get_name()
+        << "_ProcessAsync(int seqid, TProtocol iprot, TProtocol oprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl
         << indent() << "{" << endl;
     indent_up();
 
-    string argsname = tfunction->get_name() + "Args";
-    string resultname = tfunction->get_name() + "Result";
+    string argsname = tfunction->get_name() + "_args";
+    string resultname = tfunction->get_name() + "_result";
 
-    out << indent() << "var args = new " << argsname << "();" << endl
-        << indent() << "await args.ReadAsync(iprot, cancellationToken);" << endl
-        << indent() << "await iprot.ReadMessageEndAsync(cancellationToken);" << endl;
+    string args = tmp("tmp");
+    out << indent() << "var " << args << " = new InternalStructs." << argsname << "();" << endl
+        << indent() << "await " << args << ".ReadAsync(iprot, " << CANCELLATION_TOKEN_NAME << ");" << endl
+        << indent() << "await iprot.ReadMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
 
+    string tmpResult = tmp("tmp");
     if (!tfunction->is_oneway())
     {
-        out << indent() << "var result = new " << resultname << "();" << endl;
+        out << indent() << "var " << tmpResult << " = new InternalStructs." << resultname << "();" << endl;
     }
 
     out << indent() << "try" << endl
@@ -1922,15 +2328,21 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
     const vector<t_field*>& fields = arg_struct->get_members();
     vector<t_field*>::const_iterator f_iter;
 
+    bool is_deprecated = (tfunction->annotations_.end() != tfunction->annotations_.find("deprecated"));
+    if( is_deprecated) {
+      out << indent() << "#pragma warning disable CS0618,CS0612" << endl;
+    }
+
     out << indent();
     if (!tfunction->is_oneway() && !tfunction->get_returntype()->is_void())
     {
-        out << "result.Success = ";
+        out << tmpResult << ".Success = ";
     }
 
-    out << "await _iAsync." << normalize_name(tfunction->get_name()) << "Async(";
+    out << "await _iAsync." << func_name(normalize_name(tfunction->get_name()) + (add_async_postfix ? "Async" : "")) << "(";
 
     bool first = true;
+    collect_extensions_types(arg_struct);
     prepare_member_name_mapping(arg_struct);
     for (f_iter = fields.begin(); f_iter != fields.end(); ++f_iter)
     {
@@ -1943,7 +2355,7 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
             out << ", ";
         }
 
-        out << "args." << prop_name(*f_iter);
+        out << args << "." << prop_name(*f_iter);
     }
 
     cleanup_member_name_mapping(arg_struct);
@@ -1953,10 +2365,15 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
         out << ", ";
     }
 
-    out << "cancellationToken);" << endl;
+    out << "" << CANCELLATION_TOKEN_NAME << ");" << endl;
+
+    if( is_deprecated) {
+      out << indent() << "#pragma warning restore CS0618,CS0612" << endl;
+    }
 
     vector<t_field*>::const_iterator x_iter;
 
+    collect_extensions_types(xs);
     prepare_member_name_mapping(xs, xs->get_members(), resultname);
     if (xceptions.size() > 0)
     {
@@ -1965,13 +2382,14 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
 
         for (x_iter = xceptions.begin(); x_iter != xceptions.end(); ++x_iter)
         {
-            out << indent() << "catch (" << type_name((*x_iter)->get_type()) << " " << (*x_iter)->get_name() << ")" << endl
+            string tmpex = tmp("tmp");
+            out << indent() << "catch (" << type_name((*x_iter)->get_type()) << " " << tmpex << ")" << endl
                 << indent() << "{" << endl;
 
             if (!tfunction->is_oneway())
             {
                 indent_up();
-                out << indent() << "result." << prop_name(*x_iter) << " = " << (*x_iter)->get_name() << ";" << endl;
+                out << indent() << tmpResult << "." << prop_name(*x_iter) << " = " << tmpex << ";" << endl;
                 indent_down();
             }
             out << indent() << "}" << endl;
@@ -1981,24 +2399,33 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
     if (!tfunction->is_oneway())
     {
         out << indent() << "await oprot.WriteMessageBeginAsync(new TMessage(\""
-                << correct_function_name_for_async(tfunction->get_name()) << "\", TMessageType.Reply, seqid), cancellationToken); " << endl
-            << indent() << "await result.WriteAsync(oprot, cancellationToken);" << endl;
+                << tfunction->get_name() << "\", TMessageType.Reply, seqid), " << CANCELLATION_TOKEN_NAME << "); " << endl
+            << indent() << "await " << tmpResult << ".WriteAsync(oprot, " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     indent_down();
 
     cleanup_member_name_mapping(xs);
 
+    string tmpex = tmp("tmp");
     out << indent() << "}" << endl
         << indent() << "catch (TTransportException)" << endl
         << indent() << "{" << endl
         << indent() << "  throw;" << endl
         << indent() << "}" << endl
-        << indent() << "catch (Exception ex)" << endl
+        << indent() << "catch (Exception " << tmpex << ")" << endl
         << indent() << "{" << endl;
     indent_up();
 
-    out << indent() << "Console.Error.WriteLine(\"Error occurred in processor:\");" << endl
-        << indent() << "Console.Error.WriteLine(ex.ToString());" << endl;
+    string tmpvar = tmp("tmp");
+    out << indent() << "var " << tmpvar << " = $\"Error occurred in {GetType().FullName}: {" << tmpex << ".Message}\";" << endl;
+    out << indent() << "if(_logger != null)" << endl;
+    indent_up();
+    out << indent() << "_logger.LogError(" << tmpex << ", " << tmpvar << ");" << endl;
+    indent_down();
+    out << indent() << "else" << endl;
+    indent_up();
+    out << indent() << "Console.Error.WriteLine(" << tmpvar << ");" << endl;
+    indent_down();
 
     if (tfunction->is_oneway())
     {
@@ -2007,15 +2434,16 @@ void t_netstd_generator::generate_process_function_async(ostream& out, t_service
     }
     else
     {
-        out << indent() << "var x = new TApplicationException(TApplicationException.ExceptionType.InternalError,\" Internal error.\");" << endl
-            << indent() << "await oprot.WriteMessageBeginAsync(new TMessage(\"" << correct_function_name_for_async(tfunction->get_name())
-            << "\", TMessageType.Exception, seqid), cancellationToken);" << endl
-            << indent() << "await x.WriteAsync(oprot, cancellationToken);" << endl;
+        tmpvar = tmp("tmp");
+        out << indent() << "var " << tmpvar << " = new TApplicationException(TApplicationException.ExceptionType.InternalError,\" Internal error.\");" << endl
+            << indent() << "await oprot.WriteMessageBeginAsync(new TMessage(\"" << tfunction->get_name()
+            << "\", TMessageType.Exception, seqid), " << CANCELLATION_TOKEN_NAME << ");" << endl
+            << indent() << "await " << tmpvar << ".WriteAsync(oprot, " << CANCELLATION_TOKEN_NAME << ");" << endl;
         indent_down();
 
         out << indent() << "}" << endl
-            << indent() << "await oprot.WriteMessageEndAsync(cancellationToken);" << endl
-            << indent() << "await oprot.Transport.FlushAsync(cancellationToken);" << endl;
+            << indent() << "await oprot.WriteMessageEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl
+            << indent() << "await oprot.Transport.FlushAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 
     indent_down();
@@ -2028,21 +2456,22 @@ void t_netstd_generator::generate_netstd_union_reader(ostream& out, t_struct* tu
     const vector<t_field*>& fields = tunion->get_members();
     vector<t_field*>::const_iterator f_iter;
 
-    out << indent() << "public static async Task<" << tunion->get_name() << "> ReadAsync(TProtocol iprot, CancellationToken cancellationToken)" << endl;
+    out << indent() << "public static async Task<" << tunion->get_name() << "> ReadAsync(TProtocol iprot, CancellationToken " << CANCELLATION_TOKEN_NAME << ")" << endl;
     scope_up(out);
 
     out << indent() << "iprot.IncrementRecursionDepth();" << endl;
     out << indent() << "try" << endl;
     scope_up(out);
 
-    out << indent() << tunion->get_name() << " retval;" << endl;
-    out << indent() << "await iprot.ReadStructBeginAsync(cancellationToken);" << endl;
-    out << indent() << "TField field = await iprot.ReadFieldBeginAsync(cancellationToken);" << endl;
+    string tmpRetval = tmp("tmp");
+    out << indent() << tunion->get_name() << " " << tmpRetval << ";" << endl;
+    out << indent() << "await iprot.ReadStructBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+    out << indent() << "TField field = await iprot.ReadFieldBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     // we cannot have the first field be a stop -- we must have a single field defined
     out << indent() << "if (field.Type == TType.Stop)" << endl;
     scope_up(out);
-    out << indent() << "await iprot.ReadFieldEndAsync(cancellationToken);" << endl;
-    out << indent() << "retval = new ___undefined();" << endl;
+    out << indent() << "await iprot.ReadFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+    out << indent() << "" << tmpRetval << " = new ___undefined();" << endl;
     scope_down(out);
     out << indent() << "else" << endl;
     scope_up(out);
@@ -2056,37 +2485,38 @@ void t_netstd_generator::generate_netstd_union_reader(ostream& out, t_struct* tu
         out << indent() << "if (field.Type == " << type_to_enum((*f_iter)->get_type()) << ") {" << endl;
         indent_up();
 
-        out << indent() << type_name((*f_iter)->get_type()) << " temp;" << endl;
-        generate_deserialize_field(out, (*f_iter), "temp", true);
-        out << indent() << "retval = new " << (*f_iter)->get_name() << "(temp);" << endl;
+        string tmpvar = tmp("tmp");
+        out << indent() << type_name((*f_iter)->get_type()) << " " << tmpvar << ";" << endl;
+        generate_deserialize_field(out, (*f_iter), tmpvar, true);
+        out << indent() << tmpRetval << " = new " << (*f_iter)->get_name() << "(" << tmpvar << ");" << endl;
 
         indent_down();
-        out << indent() << "} else { " << endl << indent() << " await TProtocolUtil.SkipAsync(iprot, field.Type, cancellationToken);"
-            << endl << indent() << "  retval = new ___undefined();" << endl << indent() << "}" << endl
+        out << indent() << "} else { " << endl << indent() << " await TProtocolUtil.SkipAsync(iprot, field.Type, " << CANCELLATION_TOKEN_NAME << ");"
+            << endl << indent() << "  " << tmpRetval << " = new ___undefined();" << endl << indent() << "}" << endl
             << indent() << "break;" << endl;
         indent_down();
     }
 
     out << indent() << "default: " << endl;
     indent_up();
-    out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, cancellationToken);" << endl << indent()
-        << "retval = new ___undefined();" << endl;
+    out << indent() << "await TProtocolUtil.SkipAsync(iprot, field.Type, " << CANCELLATION_TOKEN_NAME << ");" << endl << indent()
+        << tmpRetval << " = new ___undefined();" << endl;
     out << indent() << "break;" << endl;
     indent_down();
 
     scope_down(out);
 
-    out << indent() << "await iprot.ReadFieldEndAsync(cancellationToken);" << endl;
+    out << indent() << "await iprot.ReadFieldEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
 
-    out << indent() << "if ((await iprot.ReadFieldBeginAsync(cancellationToken)).Type != TType.Stop)" << endl;
+    out << indent() << "if ((await iprot.ReadFieldBeginAsync(" << CANCELLATION_TOKEN_NAME << ")).Type != TType.Stop)" << endl;
     scope_up(out);
     out << indent() << "throw new TProtocolException(TProtocolException.INVALID_DATA);" << endl;
     scope_down(out);
 
     // end of else for TStop
     scope_down(out);
-    out << indent() << "await iprot.ReadStructEndAsync(cancellationToken);" << endl;
-    out << indent() << "return retval;" << endl;
+    out << indent() << "await iprot.ReadStructEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
+    out << indent() << "return " << tmpRetval << ";" << endl;
     indent_down();
 
     scope_down(out);
@@ -2101,10 +2531,7 @@ void t_netstd_generator::generate_netstd_union_reader(ostream& out, t_struct* tu
 void t_netstd_generator::generate_deserialize_field(ostream& out, t_field* tfield, string prefix, bool is_propertyless)
 {
     t_type* type = tfield->get_type();
-    while (type->is_typedef())
-    {
-        type = static_cast<t_typedef*>(type)->get_type();
-    }
+    type = resolve_typedef( type);
 
     if (type->is_void())
     {
@@ -2143,30 +2570,30 @@ void t_netstd_generator::generate_deserialize_field(ostream& out, t_field* tfiel
             case t_base_type::TYPE_STRING:
                 if (type->is_binary())
                 {
-                    out << "ReadBinaryAsync(cancellationToken);";
+                    out << "ReadBinaryAsync(" << CANCELLATION_TOKEN_NAME << ");";
                 }
                 else
                 {
-                    out << "ReadStringAsync(cancellationToken);";
+                    out << "ReadStringAsync(" << CANCELLATION_TOKEN_NAME << ");";
                 }
                 break;
             case t_base_type::TYPE_BOOL:
-                out << "ReadBoolAsync(cancellationToken);";
+                out << "ReadBoolAsync(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I8:
-                out << "ReadByteAsync(cancellationToken);";
+                out << "ReadByteAsync(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I16:
-                out << "ReadI16Async(cancellationToken);";
+                out << "ReadI16Async(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I32:
-                out << "ReadI32Async(cancellationToken);";
+                out << "ReadI32Async(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I64:
-                out << "ReadI64Async(cancellationToken);";
+                out << "ReadI64Async(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_DOUBLE:
-                out << "ReadDoubleAsync(cancellationToken);";
+                out << "ReadDoubleAsync(" << CANCELLATION_TOKEN_NAME << ");";
                 break;
             default:
                 throw "compiler error: no C# name for base type " + t_base_type::t_base_name(tbase);
@@ -2174,7 +2601,7 @@ void t_netstd_generator::generate_deserialize_field(ostream& out, t_field* tfiel
         }
         else if (type->is_enum())
         {
-            out << "ReadI32Async(cancellationToken);";
+            out << "ReadI32Async(" << CANCELLATION_TOKEN_NAME << ");";
         }
         out << endl;
     }
@@ -2188,12 +2615,12 @@ void t_netstd_generator::generate_deserialize_struct(ostream& out, t_struct* tst
 {
     if (is_union_enabled() && tstruct->is_union())
     {
-        out << indent() << prefix << " = await " << type_name(tstruct) << ".ReadAsync(iprot, cancellationToken);" << endl;
+        out << indent() << prefix << " = await " << type_name(tstruct) << ".ReadAsync(iprot, " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else
     {
         out << indent() << prefix << " = new " << type_name(tstruct) << "();" << endl
-            << indent() << "await " << prefix << ".ReadAsync(iprot, cancellationToken);" << endl;
+            << indent() << "await " << prefix << ".ReadAsync(iprot, " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 }
 
@@ -2219,15 +2646,15 @@ void t_netstd_generator::generate_deserialize_container(ostream& out, t_type* tt
 
     if (ttype->is_map())
     {
-        out << indent() << "TMap " << obj << " = await iprot.ReadMapBeginAsync(cancellationToken);" << endl;
+        out << indent() << "TMap " << obj << " = await iprot.ReadMapBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_set())
     {
-        out << indent() << "TSet " << obj << " = await iprot.ReadSetBeginAsync(cancellationToken);" << endl;
+        out << indent() << "TSet " << obj << " = await iprot.ReadSetBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_list())
     {
-        out << indent() << "TList " << obj << " = await iprot.ReadListBeginAsync(cancellationToken);" << endl;
+        out << indent() << "TList " << obj << " = await iprot.ReadListBeginAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 
     out << indent() << prefix << " = new " << type_name(ttype) << "(" << obj << ".Count);" << endl;
@@ -2254,15 +2681,15 @@ void t_netstd_generator::generate_deserialize_container(ostream& out, t_type* tt
 
     if (ttype->is_map())
     {
-        out << indent() << "await iprot.ReadMapEndAsync(cancellationToken);" << endl;
+        out << indent() << "await iprot.ReadMapEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_set())
     {
-        out << indent() << "await iprot.ReadSetEndAsync(cancellationToken);" << endl;
+        out << indent() << "await iprot.ReadSetEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_list())
     {
-        out << indent() << "await iprot.ReadListEndAsync(cancellationToken);" << endl;
+        out << indent() << "await iprot.ReadListEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 
     indent_down();
@@ -2313,10 +2740,7 @@ void t_netstd_generator::generate_deserialize_list_element(ostream& out, t_list*
 void t_netstd_generator::generate_serialize_field(ostream& out, t_field* tfield, string prefix, bool is_propertyless)
 {
     t_type* type = tfield->get_type();
-    while (type->is_typedef())
-    {
-        type = static_cast<t_typedef*>(type)->get_type();
-    }
+    type = resolve_typedef( type);
 
     string name = prefix + (is_propertyless ? "" : prop_name(tfield));
 
@@ -2355,25 +2779,25 @@ void t_netstd_generator::generate_serialize_field(ostream& out, t_field* tfield,
                 {
                     out << "WriteStringAsync(";
                 }
-                out << name << ", cancellationToken);";
+                out << name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_BOOL:
-                out << "WriteBoolAsync(" << nullable_name << ", cancellationToken);";
+                out << "WriteBoolAsync(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I8:
-                out << "WriteByteAsync(" << nullable_name << ", cancellationToken);";
+                out << "WriteByteAsync(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I16:
-                out << "WriteI16Async(" << nullable_name << ", cancellationToken);";
+                out << "WriteI16Async(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I32:
-                out << "WriteI32Async(" << nullable_name << ", cancellationToken);";
+                out << "WriteI32Async(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_I64:
-                out << "WriteI64Async(" << nullable_name << ", cancellationToken);";
+                out << "WriteI64Async(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             case t_base_type::TYPE_DOUBLE:
-                out << "WriteDoubleAsync(" << nullable_name << ", cancellationToken);";
+                out << "WriteDoubleAsync(" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
                 break;
             default:
                 throw "compiler error: no C# name for base type " + t_base_type::t_base_name(tbase);
@@ -2381,7 +2805,7 @@ void t_netstd_generator::generate_serialize_field(ostream& out, t_field* tfield,
         }
         else if (type->is_enum())
         {
-            out << "WriteI32Async((int)" << nullable_name << ", cancellationToken);";
+            out << "WriteI32Async((int)" << nullable_name << ", " << CANCELLATION_TOKEN_NAME << ");";
         }
         out << endl;
     }
@@ -2394,7 +2818,7 @@ void t_netstd_generator::generate_serialize_field(ostream& out, t_field* tfield,
 void t_netstd_generator::generate_serialize_struct(ostream& out, t_struct* tstruct, string prefix)
 {
     (void)tstruct;
-    out << indent() << "await " << prefix << ".WriteAsync(oprot, cancellationToken);" << endl;
+    out << indent() << "await " << prefix << ".WriteAsync(oprot, " << CANCELLATION_TOKEN_NAME << ");" << endl;
 }
 
 void t_netstd_generator::generate_serialize_container(ostream& out, t_type* ttype, string prefix)
@@ -2406,17 +2830,17 @@ void t_netstd_generator::generate_serialize_container(ostream& out, t_type* ttyp
     {
         out << indent() << "await oprot.WriteMapBeginAsync(new TMap(" << type_to_enum(static_cast<t_map*>(ttype)->get_key_type())
             << ", " << type_to_enum(static_cast<t_map*>(ttype)->get_val_type()) << ", " << prefix
-            << ".Count), cancellationToken);" << endl;
+            << ".Count), " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_set())
     {
         out << indent() << "await oprot.WriteSetBeginAsync(new TSet(" << type_to_enum(static_cast<t_set*>(ttype)->get_elem_type())
-            << ", " << prefix << ".Count), cancellationToken);" << endl;
+            << ", " << prefix << ".Count), " << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_list())
     {
         out << indent() << "await oprot.WriteListBeginAsync(new TList("
-            << type_to_enum(static_cast<t_list*>(ttype)->get_elem_type()) << ", " << prefix << ".Count), cancellationToken);"
+            << type_to_enum(static_cast<t_list*>(ttype)->get_elem_type()) << ", " << prefix << ".Count), " << CANCELLATION_TOKEN_NAME << ");"
             << endl;
     }
 
@@ -2459,15 +2883,15 @@ void t_netstd_generator::generate_serialize_container(ostream& out, t_type* ttyp
 
     if (ttype->is_map())
     {
-        out << indent() << "await oprot.WriteMapEndAsync(cancellationToken);" << endl;
+        out << indent() << "await oprot.WriteMapEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_set())
     {
-        out << indent() << "await oprot.WriteSetEndAsync(cancellationToken);" << endl;
+        out << indent() << "await oprot.WriteSetEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
     else if (ttype->is_list())
     {
-        out << indent() << "await oprot.WriteListEndAsync(cancellationToken);" << endl;
+        out << indent() << "await oprot.WriteListEndAsync(" << CANCELLATION_TOKEN_NAME << ");" << endl;
     }
 
     indent_down();
@@ -2505,22 +2929,22 @@ void t_netstd_generator::generate_netstd_property(ostream& out, t_field* tfield,
     {
         out << indent() << "[DataMember(Order = 0)]" << endl;
     }
+    out << indent() << (isPublic ? "public " : "private ") << type_name(tfield->get_type()) << " " << prop_name(tfield);
+
     bool is_required = field_is_required(tfield);
     if (is_required)
     {
-        out << indent() << (isPublic ? "public " : "private ") << type_name(tfield->get_type()) << " " << prop_name(tfield) << " { get; set; }" << endl;
+        out << " { get; set; }" << endl;
     }
     else
     {
-        out << indent() << (isPublic ? "public " : "private ")  << type_name(tfield->get_type()) << " " << prop_name(tfield) << endl
+        out << endl
             << indent() << "{" << endl;
         indent_up();
 
         out << indent() << "get" << endl
             << indent() << "{" << endl;
         indent_up();
-
-        bool use_nullable = false;
 
         out << indent() << "return " << fieldPrefix + tfield->get_name() << ";" << endl;
         indent_down();
@@ -2529,22 +2953,11 @@ void t_netstd_generator::generate_netstd_property(ostream& out, t_field* tfield,
             << indent() << "{" << endl;
         indent_up();
 
-        if (use_nullable)
+        if (generateIsset)
         {
-            if (generateIsset)
-            {
-                out << indent() << "__isset." << normalize_name(tfield->get_name()) << " = value.HasValue;" << endl;
-            }
-            out << indent() << "if (value.HasValue) this." << fieldPrefix + tfield->get_name() << " = value.Value;" << endl;
+            out << indent() << "__isset." << get_isset_name(normalize_name(tfield->get_name())) << " = true;" << endl;
         }
-        else
-        {
-            if (generateIsset)
-            {
-                out << indent() << "__isset." << normalize_name(tfield->get_name()) << " = true;" << endl;
-            }
-            out << indent() << "this." << fieldPrefix + tfield->get_name() << " = value;" << endl;
-        }
+        out << indent() << "this." << fieldPrefix + tfield->get_name() << " = value;" << endl;
 
         indent_down();
         out << indent() << "}" << endl;
@@ -2553,6 +2966,30 @@ void t_netstd_generator::generate_netstd_property(ostream& out, t_field* tfield,
     }
     out << endl;
 }
+
+string t_netstd_generator::make_csharp_string_literal( string const& value)
+{
+  if (value.length() == 0) {
+    return "";
+  }
+
+  std::stringstream result;
+  result << "\"";
+  for (signed char const c: value) {
+    if( (c >= 0) && (c < 32)) {  // convert ctrl chars, but leave UTF-8 alone
+      int width = std::max( (int)sizeof(c), 4);
+      result << "\\x" << std::hex << std::setw(width) << std::setfill('0') << (int)c;
+    } else if ((c == '\\') || (c == '"')) {
+      result << "\\" << c;
+    } else {
+      result << c;   // anything else "as is"
+    }
+  }
+  result << "\"";
+
+  return result.str();
+}
+
 
 string t_netstd_generator::make_valid_csharp_identifier(string const& fromName)
 {
@@ -2617,12 +3054,17 @@ string t_netstd_generator::get_mapped_member_name(string name)
     return name;
 }
 
+void t_netstd_generator::prepare_member_name_mapping(t_service* tservice)
+{
+    prepare_member_name_mapping(tservice, tservice->get_functions(), tservice->get_name());
+}
+
 void t_netstd_generator::prepare_member_name_mapping(t_struct* tstruct)
 {
     prepare_member_name_mapping(tstruct, tstruct->get_members(), tstruct->get_name());
 }
 
-void t_netstd_generator::prepare_member_name_mapping(void* scope, const vector<t_field*>& members, const string& structname)
+void t_netstd_generator::prepare_member_name_mapping(t_struct* scope, const vector<t_field*>& members, const string& structname)
 {
     // begin new scope
     member_mapping_scopes.emplace_back();
@@ -2635,10 +3077,9 @@ void t_netstd_generator::prepare_member_name_mapping(void* scope, const vector<t
     std::set<string> used_member_names;
     vector<t_field*>::const_iterator iter;
 
-    // prevent name conflicts with struct (CS0542 error)
+    // prevent name conflicts with struct (CS0542 error + THRIFT-2942)
     used_member_names.insert(structname);
-
-    // prevent name conflicts with known methods (THRIFT-2942)
+    used_member_names.insert("Isset");
     used_member_names.insert("Read");
     used_member_names.insert("Write");
 
@@ -2659,6 +3100,51 @@ void t_netstd_generator::prepare_member_name_mapping(void* scope, const vector<t
             // add always, this helps us to detect edge cases like
             // different spellings ("foo" and "Foo") within the same struct
             pverbose("struct %s: member mapping %s => %s\n", structname.c_str(), oldname.c_str(), newname.c_str());
+            active.mapping_table[oldname] = newname;
+            used_member_names.insert(newname);
+            break;
+        }
+    }
+}
+
+
+void t_netstd_generator::prepare_member_name_mapping(t_service* scope, const vector<t_function*>& members, const string& structname)
+{
+    // begin new scope
+    member_mapping_scopes.emplace_back();
+    member_mapping_scope& active = member_mapping_scopes.back();
+    active.scope_member = scope;
+
+    // current C# generator policy:
+    // - prop names are always rendered with an Uppercase first letter
+    // - struct names are used as given
+    std::set<string> used_member_names;
+    vector<t_function*>::const_iterator iter;
+
+    // prevent name conflicts with service/intf
+    used_member_names.insert(structname);
+    used_member_names.insert("Client");
+    used_member_names.insert("IAsync");
+    used_member_names.insert("AsyncProcessor");
+    used_member_names.insert("InternalStructs");
+
+    for (iter = members.begin(); iter != members.end(); ++iter)
+    {
+        string oldname = (*iter)->get_name();
+        string newname = func_name(*iter, true);
+        while (true)
+        {
+            // new name conflicts with another method
+            if (used_member_names.find(newname) != used_member_names.end())
+            {
+                pverbose("service %s: method %s conflicts with another method\n", structname.c_str(), newname.c_str());
+                newname += '_';
+                continue;
+            }
+
+            // add always, this helps us to detect edge cases like
+            // different spellings ("foo" and "Foo") within the same service
+            pverbose("service %s: method mapping %s => %s\n", structname.c_str(), oldname.c_str(), newname.c_str());
             active.mapping_table[oldname] = newname;
             used_member_names.insert(newname);
             break;
@@ -2690,6 +3176,11 @@ string t_netstd_generator::convert_to_pascal_case(const string& str) {
 }
 
 
+string t_netstd_generator::get_isset_name(const string& str) {
+  return ("Isset" != str) ? str : str + "_";
+}
+
+
 string t_netstd_generator::prop_name(t_field* tfield, bool suppress_mapping) {
   string name(tfield->get_name());
   if (suppress_mapping) {
@@ -2703,12 +3194,21 @@ string t_netstd_generator::prop_name(t_field* tfield, bool suppress_mapping) {
   return name;
 }
 
-string t_netstd_generator::type_name(t_type* ttype)
+string t_netstd_generator::func_name(t_function* tfunc, bool suppress_mapping) {
+  return func_name(tfunc->get_name(), suppress_mapping);
+}
+
+string t_netstd_generator::func_name(std::string fname, bool suppress_mapping) {
+  if (suppress_mapping) {
+    return fname;
+  }
+
+  return get_mapped_member_name(fname);
+}
+
+string t_netstd_generator::type_name(t_type* ttype, bool with_namespace)
 {
-    while (ttype->is_typedef())
-    {
-        ttype = static_cast<t_typedef*>(ttype)->get_type();
-    }
+    ttype = resolve_typedef(ttype);
 
     if (ttype->is_base_type())
     {
@@ -2733,15 +3233,18 @@ string t_netstd_generator::type_name(t_type* ttype)
         return "List<" + type_name(tlist->get_elem_type()) + ">";
     }
 
-    string the_name = check_and_correct_struct_name(normalize_name(ttype->get_name()));
+    string the_name = normalize_name(ttype->get_name());
 
-    t_program* program = ttype->get_program();
-    if (program != NULL && program != program_)
+    if(with_namespace)
     {
-        string ns = program->get_namespace("netstd");
-        if (!ns.empty())
+        t_program* program = ttype->get_program();
+        if (program != nullptr)// && program != program_)
         {
-            return ns + "." + the_name;
+            string ns =  program->get_namespace("netstd");
+            if (!ns.empty())
+            {
+                return "global::" + ns + "." + the_name;
+            }
         }
     }
 
@@ -2755,11 +3258,10 @@ string t_netstd_generator::base_type_name(t_base_type* tbase)
     case t_base_type::TYPE_VOID:
         return "void";
     case t_base_type::TYPE_STRING:
+        if (tbase->is_binary())
         {
-            if (tbase->is_binary())
-            {
-                return "byte[]";
-            }
+            return "byte[]";
+        } else {
             return "string";
         }
     case t_base_type::TYPE_BOOL:
@@ -2779,16 +3281,46 @@ string t_netstd_generator::base_type_name(t_base_type* tbase)
     }
 }
 
+string t_netstd_generator::get_deep_copy_method_call(t_type* ttype, bool& needs_typecast)
+{
+    ttype = resolve_typedef(ttype);
+
+    needs_typecast = false;
+    if (ttype->is_base_type())
+    {
+        t_base_type::t_base tbase = static_cast<t_base_type*>(ttype)->get_base();
+        switch (tbase)
+        {
+        case t_base_type::TYPE_STRING:
+            if (ttype->is_binary())
+            {
+                return ".ToArray()";
+            } else {
+                return "";  // simple assignment will do, strings are immutable in C#
+            }
+            break;
+        default:
+            return "";  // simple assignment will do
+        }
+    }
+    else if (ttype->is_enum())
+    {
+        return "";  // simple assignment will do
+    }
+    else
+    {
+        needs_typecast = (! ttype->is_container());
+        return "." + DEEP_COPY_METHOD_NAME + "()";
+    }
+}
+
 string t_netstd_generator::declare_field(t_field* tfield, bool init, string prefix)
 {
     string result = type_name(tfield->get_type()) + " " + prefix + tfield->get_name();
     if (init)
     {
         t_type* ttype = tfield->get_type();
-        while (ttype->is_typedef())
-        {
-            ttype = static_cast<t_typedef*>(ttype)->get_type();
-        }
+        ttype = resolve_typedef(ttype);
         if (ttype->is_base_type() && field_has_default(tfield))
         {
             std::ofstream dummy;
@@ -2837,31 +3369,33 @@ string t_netstd_generator::declare_field(t_field* tfield, bool init, string pref
 string t_netstd_generator::function_signature(t_function* tfunction, string prefix)
 {
     t_type* ttype = tfunction->get_returntype();
-    return type_name(ttype) + " " + normalize_name(prefix + tfunction->get_name()) + "(" + argument_list(tfunction->get_arglist()) + ")";
+    return type_name(ttype) + " " + func_name(normalize_name(prefix + tfunction->get_name())) + "(" + argument_list(tfunction->get_arglist()) + ")";
 }
 
-string t_netstd_generator::function_signature_async(t_function* tfunction, string prefix)
+string t_netstd_generator::function_signature_async(t_function* tfunction, string prefix, int mode)
 {
     t_type* ttype = tfunction->get_returntype();
-    string task = "Task";
-    if (!ttype->is_void())
+    string task = "global::System.Threading.Tasks.Task";
+    if ((!ttype->is_void()) && ((mode & MODE_NO_RETURN) == 0))
     {
         task += "<" + type_name(ttype) + ">";
     }
 
-    string result = task + " " + normalize_name(prefix + tfunction->get_name()) + "Async(";
-    string args = argument_list(tfunction->get_arglist());
-    result += args;
-    if (!args.empty())
-    {
-        result += ", ";
+    string result = task + " " + func_name(normalize_name(prefix + tfunction->get_name()) + (add_async_postfix ? "Async" : "")) + "(";
+    if((mode & MODE_NO_ARGS) == 0) {
+        string args = argument_list(tfunction->get_arglist());
+        result += args;
+        if (!args.empty())
+        {
+            result += ", ";
+        }
     }
-    result += "CancellationToken cancellationToken = default(CancellationToken))";
+    result += "CancellationToken " + CANCELLATION_TOKEN_NAME + " = default)";
 
     return result;
 }
 
-string t_netstd_generator::argument_list(t_struct* tstruct)
+string t_netstd_generator::argument_list(t_struct* tstruct, bool with_types)
 {
     string result = "";
     const vector<t_field*>& fields = tstruct->get_members();
@@ -2877,17 +3411,19 @@ string t_netstd_generator::argument_list(t_struct* tstruct)
         {
             result += ", ";
         }
-        result += type_name((*f_iter)->get_type()) + " " + normalize_name((*f_iter)->get_name());
+
+        if( with_types) {
+            result += type_name((*f_iter)->get_type()) + " ";
+        }
+
+        result += normalize_name((*f_iter)->get_name(),true);
     }
     return result;
 }
 
 string t_netstd_generator::type_to_enum(t_type* type)
 {
-    while (type->is_typedef())
-    {
-        type = static_cast<t_typedef*>(type)->get_type();
-    }
+    type = resolve_typedef( type);
 
     if (type->is_base_type())
     {
@@ -3024,11 +3560,11 @@ string t_netstd_generator::get_enum_class_name(t_type* type)
 {
     string package = "";
     t_program* program = type->get_program();
-    if (program != NULL && program != program_)
+    if (program != nullptr) // && program != program_)
     {
         package = program->get_namespace("netstd") + ".";
     }
-    return package + type->get_name();
+    return "global::" + package + type->get_name();
 }
 
 THRIFT_REGISTER_GENERATOR(
@@ -3038,4 +3574,6 @@ THRIFT_REGISTER_GENERATOR(
     "    serial:          Add serialization support to generated classes.\n"
     "    union:           Use new union typing, which includes a static read function for union types.\n"
     "    pascal:          Generate Pascal Case property names according to Microsoft naming convention.\n"
+    "    no_deepcopy:     Suppress generation of DeepCopy() method.\n"
+    "    async_postfix:   Append \"Async\" to all service methods (maintains compatibility with existing code).\n"
 )
